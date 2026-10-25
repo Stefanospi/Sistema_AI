@@ -1,0 +1,116 @@
+# Router AI su OpenRouter: ogni categoria ha una lista ORDINATA di modelli.
+# Si prova il primo; se fallisce (429, modello ritirato, risposta vuota) si passa al successivo.
+# I modelli gratuiti ruotano spesso: controlla con `python chat.py --liste-free`.
+
+fallback_globale: openrouter/free   # ultimo tentativo, sceglie OpenRouter
+
+memoria:
+  max_messaggi: 24   # oltre questa soglia la parte vecchia viene riassunta
+
+rate_limit:          # gestione errore 429
+  max_tentativi: 2   # riprove sullo stesso modello prima di passare al successivo
+  attesa_max_s: 30   # se Retry-After supera questo valore si passa subito al modello successivo
+
+strumenti:           # usati solo dalla CLI con --agente; ogni modifica chiede conferma
+  abilitati: true
+  max_passi: 8
+  max_read_bytes: 200000
+  run_command:
+    abilitato: false   # spento di default
+    consentiti: []     # es. ["git", "python", "pytest"]; vuoto = nessun comando
+    timeout: 60
+
+classificatore_llm:  # opzionale: usato SOLO se le regole a parole chiave non trovano nulla
+  abilitato: false   # spento di default (il testo della richiesta va a un modello gratuito)
+  modello: nvidia/nemotron-3.5-lightning:free
+
+log:                 # registro locale: solo modello, categoria, durata ed errori (mai testi o chiavi)
+  abilitato: true
+  file: router.log
+
+server:              # configurazione del server compatibile OpenAI (server.py)
+  porta: 8000        # porta TCP (es. 8000)
+  # host è sempre 127.0.0.1 per sicurezza; non modificare
+  reload: false      # true solo in sviluppo (riavvio automatico al salvataggio)
+
+visione:             # modelli con input immagine (verificati su openrouter.ai/api/v1/models)
+  modelli:
+    - nvidia/nemotron-3.5-super-vl:free
+    - thinkingmachines/inkling-small:free
+    - google/gemma-4-26b-a4b-it:free
+
+categories:
+  coding:
+    sensibile: false
+    models:
+      - nvidia/nemotron-3.5-super-vl:free
+      - thinkingmachines/inkling-small:free
+      - poolside/laguna-s-2.1:free
+      - cohere/north-mini-code:free
+    keywords: ["codice", "bug", "errore", "errori", "funzione", "classe", "c#", ".net",
+               "angular", "python", "sql", "api", "query", "debug*", "refactor*",
+               "typescript", "javascript", "php", "git", "docker", "compil*",
+               "endpoint", "script", "programm*", "repository", "repo", "llm"]
+    system: >
+      Sei un assistente di programmazione Full Stack esperto, con solidissime basi in tutti i principali linguaggi e framework, 
+      specializzato nel fornire soluzioni pratiche e ottimizzate, evitando complessità inutili. I tuoi linguaggi e framework principali includono C#/.NET, Angular, Python, PHP, SQL, API REST e AI/LLM.
+      Rispondi in italiano, con codice corretto e commentato solo dove serve. Spiega brevemente le scelte.
+
+  finanza:
+    sensibile: true
+    models:
+      - thinkingmachines/inkling-small:free
+      - thinkingmachines/inkling:free
+      - nvidia/nemotron-3-ultra-550b-a55b:free
+    keywords: ["finanz*", "invest*", "azioni", "etf", "portafoglio", "budget", "spese",
+               "risparm*", "mutuo", "tasse", "bilancio", "dividend*", "obbligazion*",
+               "borsa", "crypto", "bitcoin", "inflazione", "rendimento", "rendimenti"]
+    system: >
+      Sei un assistente di finanza personale. Ragiona passo passo, esplicita le ipotesi e non inventare numeri.
+      Non sei un consulente finanziario: fornisci informazioni e scenari, non raccomandazioni di acquisto.
+      Per i calcoli precisi proponi uno script invece di fare conti a mente.
+
+  documenti:
+    sensibile: true
+    models:
+      - nvidia/nemotron-3.5-super-vl:free
+      - nvidia/nemotron-3-ultra-550b-a55b:free
+      - thinkingmachines/inkling:free
+    keywords: ["document*", "pdf", "contratto", "docx", "fattura", "relazione", "estrai",
+               "estrarre", "modulo", "word", "excel", "allegato", "scansione", "ocr"]
+    system: >
+      Sei un assistente per la gestione di documenti: riassumi, estrai dati, confronta, riformula.
+      Cita sempre da quale parte del testo ricavi un'informazione. Se un dato non c'è, dillo.
+
+  appunti:
+    sensibile: false
+    models:
+      - nvidia/nemotron-3.5-lightning:free
+      - google/gemma-4-26b-a4b-it:free
+      - dots-studio/dots-3-note-preview:free
+    keywords: ["appunt*", "riassum*", "riassunt*", "nota", "note", "promemoria", "todo",
+               "idee", "verbale", "trascriv*", "organizz*", "agenda", "checklist", "brainstorm*"]
+    system: >
+      Sei un assistente per appunti: riassumi, riordina, estrai punti chiave e attività da fare.
+      Sii sintetico e usa elenchi puntati quando aiutano.
+
+  desktop:
+    sensibile: false
+    models:
+      - nvidia/nemotron-3.5-super-vl:free
+      - thinkingmachines/inkling-small:free
+      - google/gemma-4-26b-a4b-it:free
+    keywords: ["desktop", "schermo", "schermata", "screenshot", "finestra", "clicca",
+               "mouse", "tastiera", "cartella", "automatizz*"]
+    system: >
+      Sei un assistente per l'automazione del desktop. Proponi azioni concrete, una per volta,
+      e chiedi conferma prima di qualsiasi operazione distruttiva (cancellare, sovrascrivere, inviare).
+
+  generale:
+    sensibile: false
+    models:
+      - nvidia/nemotron-3.5-super-vl:free
+      - thinkingmachines/inkling-small:free
+    keywords: []
+    system: >
+      Sei un assistente generale. Rispondi in italiano, in modo chiaro e conciso.

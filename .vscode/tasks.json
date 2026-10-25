@@ -1,0 +1,87 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "AI Router: avvia server",
+            "type": "shell",
+            "command": "python server.py",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "echo": true,
+                "showReuseMessage": false,
+                "clear": true
+            },
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": "^ERROR:.*$",
+                    "message": 1
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "Avvio server AI Router",
+                    "endsPattern": "Application startup complete"
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            }
+        },
+        {
+            "label": "AI Router: avvia CLI",
+            "type": "shell",
+            "command": "python chat.py",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "echo": true,
+                "clear": true
+            },
+            "group": "none"
+        },
+        {
+            "label": "AI Router: avvia CLI (con agente)",
+            "type": "shell",
+            "command": "python chat.py --agente",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "echo": true,
+                "clear": true
+            },
+            "group": "none"
+        },
+        {
+            "label": "AI Router: esegui test",
+            "type": "shell",
+            "command": "python -m pytest tests/ -v",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "clear": true
+            },
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
+        }
+    ]
+}

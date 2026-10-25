@@ -1,0 +1,9 @@
+.env
+memoria.db
+__pycache__/
+.venv/
+.ai_backup/
+.pytest_cache/
+*.log
+
+.fake
