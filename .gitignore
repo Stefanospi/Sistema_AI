@@ -1,5 +1,7 @@
 .env
 memoria.db
+memoria.db-shm
+memoria.db-wal
 __pycache__/
 .venv/
 .ai_backup/

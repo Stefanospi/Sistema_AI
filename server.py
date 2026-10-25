@@ -256,14 +256,14 @@ def _proxy_complete(router, messages: list[dict], model: str,
         })
     else:
         content = (msg_obj.content or "").strip()
-        response = JSONResponse(_build_response(used_model, content))
-
-    # Salva in cache se applicabile (nessuna tool_call)
-    if cache_key is not None and not getattr(msg_obj, "tool_calls", None):
-        try:
-            response_cache.set(cache_key, response.body if hasattr(response, 'body') else json.dumps(response.content).encode())
-        except Exception:
-            pass  # cache best-effort
+        response_dict = _build_response(used_model, content)
+        # Salva il dict in cache (non i bytes): JSONResponse(content=dict) funziona
+        if cache_key is not None:
+            try:
+                response_cache.set(cache_key, response_dict)
+            except Exception:
+                pass  # cache best-effort
+        response = JSONResponse(response_dict)
 
     return response
 
