@@ -1,0 +1,318 @@
+diff --git a/capri_bridge.py b/capri_bridge.py
+new file mode 100644
+index 0000000..ce63bae
+--- /dev/null
++++ b/capri_bridge.py
+@@ -0,0 +1,86 @@
++"""Ponte verso Capri (capri-desktop).
++
++Invia a http://127.0.0.1:47823/event eventi nello stesso formato degli hook di Claude Code,
++così Capri reagisce al router come se fosse Claude Code: ticker con il modello in uso,
++festeggiamento a fine risposta, reazione agli errori.
++
++Fire-and-forget: non rallenta mai il router; se Capri è spenta non succede nulla.
++Tutto resta su 127.0.0.1. Per spegnerlo: CAPRI_ENABLED=0 nel .env.
++"""
++from __future__ import annotations
++
++import http.client
++import json
++import os
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++
++PORT = int(os.getenv("CAPRI_PORT") or 47823)
++SESSION = "router"
++CWD = str(Path(__file__).parent)
++
++# un solo worker = gli eventi arrivano a Capri nell'ordine in cui li emettiamo
++_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="capri")
++
++
++def _enabled() -> bool:
++    return os.getenv("CAPRI_ENABLED", "1") != "0"
++
++
++def _clip(text, n: int) -> str:
++    text = str(text or "")
++    return text if len(text) <= n else text[:n] + "…"
++
++
++def _post(body: bytes) -> None:
++    try:
++        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=0.5)
++        conn.request("POST", "/event", body, {"content-type": "application/json"})
++        conn.getresponse().read()
++        conn.close()
++    except Exception:
++        pass  # Capri spenta o non raggiungibile: va bene così
++
++
++def emit(event: str, **fields) -> None:
++    if not _enabled():
++        return
++    evt = {"hook_event_name": event, "session_id": SESSION, "cwd": CWD, **fields}
++    try:
++        _pool.submit(_post, json.dumps(evt, ensure_ascii=False).encode("utf-8"))
++    except Exception:
++        pass
++
++
++# ---- eventi di alto livello -------------------------------------------------
++
++def prompt(text: str, category: str | None = None) -> None:
++    """Inizio richiesta (Capri si mette 'al lavoro')."""
++    title = f"router · {category}" if category else "router"
++    emit("UserPromptSubmit", prompt=_clip(" ".join(str(text).split()), 280), session_title=title)
++
++
++def attempt(model: str) -> None:
++    """Un tentativo su un modello: il ticker di Capri mostra 'router › <modello>'."""
++    emit("PreToolUse", tool_name=f"mcp__router__{model}", tool_input={})
++
++
++def tool(name: str, arguments: str | dict | None = None) -> None:
++    """Uno strumento eseguito dall'agente (CLI --agente)."""
++    args = arguments
++    if isinstance(args, str):
++        try:
++            args = json.loads(args)
++        except ValueError:
++            args = {}
++    emit("PreToolUse", tool_name=name, tool_input=args if isinstance(args, dict) else {})
++
++
++def done(answer: str) -> None:
++    """Risposta completata (Capri festeggia e mostra l'inizio della risposta)."""
++    emit("Stop", last_assistant_message=_clip(answer, 6000))
++
++
++def failed(error: str) -> None:
++    """Tutti i modelli hanno fallito."""
++    emit("StopFailure", error=_clip(error, 280))
+diff --git a/router.py b/router.py
+index d130560..269de9b 100644
+--- a/router.py
++++ b/router.py
+@@ -15,6 +15,7 @@ from types import SimpleNamespace
+ import httpx
+ import requests
+ import yaml
++import capri_bridge as capri
+ from cache import TTLCache
+ from dotenv import load_dotenv, set_key
+ from openai import APIError, OpenAI, RateLimitError
+@@ -241,6 +242,12 @@ class Router:
+             return None
+         return max(value, 0.0)
+ 
++    @staticmethod
++    def _notify_attempt(model: str, category: str | None) -> None:
++        """Avvisa Capri del tentativo; classificatore e riassunti (senza categoria) restano muti."""
++        if category and category != "classificatore":
++            capri.attempt(model)
++
+     def _candidates(self, models: list[str], tools, vision: bool, use_global: bool) -> list[str]:
+         cands = list(models)
+         if use_global and not vision:
+@@ -274,6 +281,7 @@ class Router:
+         errors = []
+         for model in self._candidates(models, tools, vision, use_global):
+             t0 = time.monotonic()
++            self._notify_attempt(model, category)
+             try:
+                 r = self._create(model, messages, tools)
+                 if not r.choices:
+@@ -296,6 +304,7 @@ class Router:
+         errors = []
+         for model in self._candidates(models, tools, vision, use_global):
+             t0 = time.monotonic()
++            self._notify_attempt(model, category)
+             emitted = False
+             parts: list[str] = []
+             calls: dict[int, dict] = {}
+@@ -370,6 +379,7 @@ class Router:
+                                for c in calls],
+             })
+             for c in calls:
++                capri.tool(c.function.name, c.function.arguments)
+                 result = toolbox.execute(c.function.name, c.function.arguments)
+                 messages.append({"role": "tool", "tool_call_id": c.id, "content": result})
+         return model, "Mi sono fermato: raggiunto il numero massimo di passi dell'agente."
+@@ -392,6 +402,7 @@ class Router:
+             if cached is not None:
+                 return category, cached["model"], cached["answer"]
+ 
++        capri.prompt(text, category)
+         cat = self.cfg["categories"][category]
+         if images and category != "desktop":
+             raise RuntimeError("Le immagini sono supportate solo nella categoria desktop.")
+@@ -417,12 +428,14 @@ class Router:
+             else:
+                 model, msg = self._step(cat["models"], messages, None, vision, on_text, on_model, category)
+                 answer = (msg.content or "").strip()
+-        except RuntimeError:
++        except RuntimeError as e:
+             log.info("richiesta categoria=%s esito=fallita ms=%d", category, (time.monotonic() - t0) * 1000)
++            capri.failed(str(e))
+             raise
+         log.info("richiesta categoria=%s modello=%s esito=ok stream=%d agente=%d immagini=%d ms=%d",
+                  category, model, on_text is not None, toolbox is not None, len(images or []),
+                  (time.monotonic() - t0) * 1000)
++        capri.done(answer)
+         # in memoria solo testo: le immagini non vengono conservate
+         self.memory.add(session, "user", text + (f"\n[{len(images)} immagine/i allegata/e]" if images else ""), category)
+         self.memory.add(session, "assistant", answer, category)
+diff --git a/server.py b/server.py
+index 3408fde..80cf16f 100644
+--- a/server.py
++++ b/server.py
+@@ -30,6 +30,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+ from openai import APIError
+ from pydantic import BaseModel, Field
+ 
++import capri_bridge as capri
+ from cache import response_cache, model_list_cache
+ 
+ BASE_DIR = Path(__file__).parent
+@@ -133,6 +134,14 @@ def _resolve_models(router, model: str, messages: list[dict]) -> tuple[list[str]
+     return router.cfg["categories"][cat_name]["models"], cat_name
+ 
+ 
++def _last_user_text(messages: list[dict]) -> str:
++    """Ultimo messaggio utente come testo (serve a Capri per mostrare cosa stai chiedendo)."""
++    last = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
++    if isinstance(last, list):
++        last = " ".join(p.get("text", "") for p in last if isinstance(p, dict))
++    return str(last or "")
++
++
+ # ---------- helper: chiave cache per richiesta ----------
+ 
+ def _cache_key(body: dict) -> str:
+@@ -204,6 +213,7 @@ def _proxy_complete(router, messages: list[dict], model: str,
+             return JSONResponse(content=cached)
+ 
+     models_list, cat_name = _resolve_models(router, model, messages)
++    capri.prompt(_last_user_text(messages), cat_name)
+ 
+     tool_schemas = tools if tools else None
+     try:
+@@ -211,9 +221,12 @@ def _proxy_complete(router, messages: list[dict], model: str,
+             models_list, messages, tool_schemas, category=cat_name
+         )
+     except RuntimeError as e:
++        capri.failed(str(e))
+         return openai_error(502, str(e))
+     except APIError as e:
++        capri.failed(str(e))
+         return openai_error(getattr(e, "status_code", 502) or 502, str(e))
++    capri.done(getattr(msg_obj, "content", "") or "")
+ 
+     # Gestione tool_calls nella risposta
+     if getattr(msg_obj, "tool_calls", None):
+@@ -259,14 +272,18 @@ async def _proxy_stream(router, messages: list[dict], model: str,
+                         tools: list | None) -> AsyncGenerator[str, None]:
+     """Proxy stream: genera SSE, con fallback prima del primo token."""
+     models_list, cat_name = _resolve_models(router, model, messages)
++    capri.prompt(_last_user_text(messages), cat_name)
+ 
+     tool_schemas = tools if tools else None
+     used_model = model  # aggiornato al primo "start"
++    parts: list[str] = []
++    failed = False
+     try:
+         for ev in router._stream(models_list, messages, tool_schemas, category=cat_name):
+             if ev[0] == "start":
+                 used_model = ev[1]
+             elif ev[0] == "text":
++                parts.append(ev[1])
+                 yield _build_chunk(used_model, ev[1])
+             elif ev[0] == "final":
+                 used_model = ev[1]
+@@ -302,10 +319,16 @@ async def _proxy_stream(router, messages: list[dict], model: str,
+                 else:
+                     yield _build_chunk(used_model, None, "stop")
+     except RuntimeError as e:
++        failed = True
++        capri.failed(str(e))
+         err_chunk = {
+             "error": {"message": str(e), "type": "server_error", "code": "502"}
+         }
+         yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
++    finally:
++        # anche se l'editor chiude la connessione a metà, Capri non resta "al lavoro"
++        if not failed:
++            capri.done("".join(parts))
+     yield "data: [DONE]\n\n"
+ 
+ 
+diff --git a/tests/test_capri_bridge.py b/tests/test_capri_bridge.py
+new file mode 100644
+index 0000000..944413e
+--- /dev/null
++++ b/tests/test_capri_bridge.py
+@@ -0,0 +1,63 @@
++"""Il ponte verso Capri: eventi nell'ordine giusto, formato hook di Claude Code, nessun errore se Capri è spenta."""
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++import capri_bridge as capri
++
++
++def _fake_capri():
++    events = []
++
++    class H(BaseHTTPRequestHandler):
++        def do_POST(self):
++            n = int(self.headers["content-length"])
++            events.append(json.loads(self.rfile.read(n)))
++            self.send_response(200)
++            self.end_headers()
++
++        def log_message(self, *a):
++            pass
++
++    srv = HTTPServer(("127.0.0.1", 0), H)
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    return srv, events
++
++
++def _flush():
++    capri._pool.submit(lambda: None).result(timeout=3)
++
++
++def test_sequenza_eventi(monkeypatch):
++    srv, events = _fake_capri()
++    monkeypatch.setattr(capri, "PORT", srv.server_address[1])
++    capri.prompt("ciao  come\nstai", "coding")
++    capri.attempt("nvidia/nemotron:free")
++    capri.tool("read_file", '{"path": "a.py"}')
++    capri.done("tutto ok")
++    _flush()
++    srv.shutdown()
++    assert [e["hook_event_name"] for e in events] == ["UserPromptSubmit", "PreToolUse", "PreToolUse", "Stop"]
++    assert events[0]["prompt"] == "ciao come stai"
++    assert events[0]["session_title"] == "router · coding"
++    assert events[1]["tool_name"] == "mcp__router__nvidia/nemotron:free"
++    assert events[2]["tool_input"] == {"path": "a.py"}
++    assert events[3]["last_assistant_message"] == "tutto ok"
++    assert all(e["session_id"] == "router" for e in events)
++
++
++def test_capri_spenta_non_rompe_nulla(monkeypatch):
++    monkeypatch.setattr(capri, "PORT", 1)  # nessuno in ascolto
++    capri.prompt("x")
++    capri.failed("boom")
++    _flush()  # non deve sollevare
++
++
++def test_disattivabile(monkeypatch):
++    srv, events = _fake_capri()
++    monkeypatch.setattr(capri, "PORT", srv.server_address[1])
++    monkeypatch.setenv("CAPRI_ENABLED", "0")
++    capri.prompt("x")
++    _flush()
++    srv.shutdown()
++    assert events == []

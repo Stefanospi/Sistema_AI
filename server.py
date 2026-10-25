@@ -30,6 +30,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import APIError
 from pydantic import BaseModel, Field
 
+import capri_bridge as capri
 from cache import response_cache, model_list_cache
 
 BASE_DIR = Path(__file__).parent
@@ -133,6 +134,14 @@ def _resolve_models(router, model: str, messages: list[dict]) -> tuple[list[str]
     return router.cfg["categories"][cat_name]["models"], cat_name
 
 
+def _last_user_text(messages: list[dict]) -> str:
+    """Ultimo messaggio utente come testo (serve a Capri per mostrare cosa stai chiedendo)."""
+    last = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    if isinstance(last, list):
+        last = " ".join(p.get("text", "") for p in last if isinstance(p, dict))
+    return str(last or "")
+
+
 # ---------- helper: chiave cache per richiesta ----------
 
 def _cache_key(body: dict) -> str:
@@ -204,6 +213,7 @@ def _proxy_complete(router, messages: list[dict], model: str,
             return JSONResponse(content=cached)
 
     models_list, cat_name = _resolve_models(router, model, messages)
+    capri.prompt(_last_user_text(messages), cat_name)
 
     tool_schemas = tools if tools else None
     try:
@@ -211,9 +221,12 @@ def _proxy_complete(router, messages: list[dict], model: str,
             models_list, messages, tool_schemas, category=cat_name
         )
     except RuntimeError as e:
+        capri.failed(str(e))
         return openai_error(502, str(e))
     except APIError as e:
+        capri.failed(str(e))
         return openai_error(getattr(e, "status_code", 502) or 502, str(e))
+    capri.done(getattr(msg_obj, "content", "") or "")
 
     # Gestione tool_calls nella risposta
     if getattr(msg_obj, "tool_calls", None):
@@ -259,14 +272,18 @@ async def _proxy_stream(router, messages: list[dict], model: str,
                         tools: list | None) -> AsyncGenerator[str, None]:
     """Proxy stream: genera SSE, con fallback prima del primo token."""
     models_list, cat_name = _resolve_models(router, model, messages)
+    capri.prompt(_last_user_text(messages), cat_name)
 
     tool_schemas = tools if tools else None
     used_model = model  # aggiornato al primo "start"
+    parts: list[str] = []
+    failed = False
     try:
         for ev in router._stream(models_list, messages, tool_schemas, category=cat_name):
             if ev[0] == "start":
                 used_model = ev[1]
             elif ev[0] == "text":
+                parts.append(ev[1])
                 yield _build_chunk(used_model, ev[1])
             elif ev[0] == "final":
                 used_model = ev[1]
@@ -302,10 +319,16 @@ async def _proxy_stream(router, messages: list[dict], model: str,
                 else:
                     yield _build_chunk(used_model, None, "stop")
     except RuntimeError as e:
+        failed = True
+        capri.failed(str(e))
         err_chunk = {
             "error": {"message": str(e), "type": "server_error", "code": "502"}
         }
         yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+    finally:
+        # anche se l'editor chiude la connessione a metà, Capri non resta "al lavoro"
+        if not failed:
+            capri.done("".join(parts))
     yield "data: [DONE]\n\n"
 
 

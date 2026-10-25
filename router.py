@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import httpx
 import requests
 import yaml
+import capri_bridge as capri
 from cache import TTLCache
 from dotenv import load_dotenv, set_key
 from openai import APIError, OpenAI, RateLimitError
@@ -241,6 +242,12 @@ class Router:
             return None
         return max(value, 0.0)
 
+    @staticmethod
+    def _notify_attempt(model: str, category: str | None) -> None:
+        """Avvisa Capri del tentativo; classificatore e riassunti (senza categoria) restano muti."""
+        if category and category != "classificatore":
+            capri.attempt(model)
+
     def _candidates(self, models: list[str], tools, vision: bool, use_global: bool) -> list[str]:
         cands = list(models)
         if use_global and not vision:
@@ -274,6 +281,7 @@ class Router:
         errors = []
         for model in self._candidates(models, tools, vision, use_global):
             t0 = time.monotonic()
+            self._notify_attempt(model, category)
             try:
                 r = self._create(model, messages, tools)
                 if not r.choices:
@@ -296,6 +304,7 @@ class Router:
         errors = []
         for model in self._candidates(models, tools, vision, use_global):
             t0 = time.monotonic()
+            self._notify_attempt(model, category)
             emitted = False
             parts: list[str] = []
             calls: dict[int, dict] = {}
@@ -370,6 +379,7 @@ class Router:
                                for c in calls],
             })
             for c in calls:
+                capri.tool(c.function.name, c.function.arguments)
                 result = toolbox.execute(c.function.name, c.function.arguments)
                 messages.append({"role": "tool", "tool_call_id": c.id, "content": result})
         return model, "Mi sono fermato: raggiunto il numero massimo di passi dell'agente."
@@ -392,6 +402,7 @@ class Router:
             if cached is not None:
                 return category, cached["model"], cached["answer"]
 
+        capri.prompt(text, category)
         cat = self.cfg["categories"][category]
         if images and category != "desktop":
             raise RuntimeError("Le immagini sono supportate solo nella categoria desktop.")
@@ -417,12 +428,14 @@ class Router:
             else:
                 model, msg = self._step(cat["models"], messages, None, vision, on_text, on_model, category)
                 answer = (msg.content or "").strip()
-        except RuntimeError:
+        except RuntimeError as e:
             log.info("richiesta categoria=%s esito=fallita ms=%d", category, (time.monotonic() - t0) * 1000)
+            capri.failed(str(e))
             raise
         log.info("richiesta categoria=%s modello=%s esito=ok stream=%d agente=%d immagini=%d ms=%d",
                  category, model, on_text is not None, toolbox is not None, len(images or []),
                  (time.monotonic() - t0) * 1000)
+        capri.done(answer)
         # in memoria solo testo: le immagini non vengono conservate
         self.memory.add(session, "user", text + (f"\n[{len(images)} immagine/i allegata/e]" if images else ""), category)
         self.memory.add(session, "assistant", answer, category)
