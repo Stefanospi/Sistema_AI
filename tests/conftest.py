@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from router import Memory, Router  # noqa: E402
 
+TEST_CONFIG = Path(__file__).parent / "config.test.yaml"
+
 
 def msg(content=None, tool_calls=None):
     return SimpleNamespace(content=content, tool_calls=tool_calls)
@@ -95,8 +97,8 @@ def make_router(tmp_path):
     sleeps = []
 
     def factory(script, **cfg_overrides):
-        r = Router(client=FakeClient(script), memory=Memory(tmp_path / "m.db"), sleep=sleeps.append,
-                   log_file=tmp_path / "test.log")
+        r = Router(config_path=TEST_CONFIG, client=FakeClient(script), memory=Memory(tmp_path / "m.db"),
+                   sleep=sleeps.append, log_file=tmp_path / "test.log")
         r.cfg.update(cfg_overrides)
         return r
 

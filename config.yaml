@@ -43,8 +43,8 @@ categories:
   coding:
     sensibile: false
     models:
+      - google/gemma-4-31b-it:free
       - nvidia/nemotron-3.5-super-vl:free
-      - thinkingmachines/inkling-small:free
       - poolside/laguna-s-2.1:free
       - cohere/north-mini-code:free
     keywords: ["codice", "bug", "errore", "errori", "funzione", "classe", "c#", ".net",

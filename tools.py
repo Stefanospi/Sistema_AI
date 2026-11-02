@@ -265,12 +265,12 @@ class Toolbox:
         for k, v in clean.items():
             if props[k]["type"] == "string" and not isinstance(v, str):
                 return f"Errore: l'argomento {k} deve essere una stringa."
-            try:
-                return getattr(self, name)(**clean)
-            except ToolError as e:
-                return f"Errore: {e}"
-            except OSError as e:
-                return f"Errore di accesso al file: {e.__class__.__name__}"
+        try:
+            return getattr(self, name)(**clean)
+        except ToolError as e:
+            return f"Errore: {e}"
+        except OSError as e:
+            return f"Errore di accesso al file: {e.__class__.__name__}"
 
 
 class CachedToolbox(Toolbox):

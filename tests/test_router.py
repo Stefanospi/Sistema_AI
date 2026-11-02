@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from conftest import conn_error, msg, rate_limit, tool_call
@@ -101,3 +103,28 @@ def test_compattazione_fallita_non_perde_messaggi(make_router):
     r.ask("s", "b", "generale")
     assert r.memory.summary("s") == ""
     assert len(r.memory.active("s")) == 4
+
+
+# ---------- cooldown dei modelli che falliscono ----------
+
+def test_403_mette_il_modello_in_pausa(make_router):
+    import httpx
+    from openai import PermissionDeniedError
+
+    M1 = "nvidia/nemotron-3.5-super-vl:free"
+    M2 = "thinkingmachines/inkling-small:free"
+    denied = PermissionDeniedError(
+        "403", response=httpx.Response(403, request=httpx.Request("POST", "http://x")), body=None)
+    r = make_router({M1: [msg("ok1"), msg("ok2")], M2: [denied, msg("non deve servire")]})
+    models = [M2, M1]
+    assert r._complete(models, [{"role": "user", "content": "a"}], use_global=False)[0] == M1
+    # il secondo giro salta M2 (in pausa): niente nuovo tentativo sul modello che dava 403
+    assert r._complete(models, [{"role": "user", "content": "b"}], use_global=False)[0] == M1
+    assert len(r.client.calls) == 3  # M2, M1, M1
+
+
+def test_se_tutti_in_pausa_li_prova_comunque(make_router):
+    M1 = "nvidia/nemotron-3.5-super-vl:free"
+    r = make_router({M1: [msg("ok")]})
+    r._cooldown[M1] = time.monotonic() + 999
+    assert r._complete([M1], [{"role": "user", "content": "a"}], use_global=False)[0] == M1

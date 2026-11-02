@@ -142,6 +142,7 @@ class Router:
             self.cfg = yaml.safe_load(f)
         setup_logging(self.cfg, log_file)
         self._no_tools: set[str] = set()  # modelli che hanno rifiutato i tool nativi (validi per questa esecuzione)
+        self._cooldown: dict[str, float] = {}  # modello -> istante (monotonic) fino al quale viene saltato
         # cache risposte: TTL 5 min, max 200 entrate
         self._response_cache = TTLCache(ttl_seconds=300, max_size=200)
         # client/memory/sleep iniettabili: servono ai test (nessuna rete, nessuna attesa reale)
@@ -210,12 +211,15 @@ class Router:
         return self._classify_rules(text) or self._classify_llm(text) or "generale"
 
     # -- chiamata con fallback --
-    def _create(self, model: str, messages: list[dict], tools: list[dict] | None, stream: bool = False):
+    def _create(self, model: str, messages: list[dict], tools: list[dict] | None, stream: bool = False,
+                tool_choice=None):
         """Una chiamata; sul 429 attende (Retry-After se presente) e riprova, con un tetto di tentativi."""
         rl = self.cfg.get("rate_limit", {})
         max_retries = int(rl.get("max_tentativi", 2))
         max_wait = float(rl.get("attesa_max_s", 30))
         kwargs = {"tools": tools} if tools else {}
+        if tools and tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         if stream:
             kwargs["stream"] = True
         for attempt in range(max_retries + 1):
@@ -262,7 +266,18 @@ class Router:
             cands = [m for m in cands if m not in self._no_tools]
             if not cands:
                 raise RuntimeError("Nessun modello disponibile che supporti gli strumenti (tool nativi).")
-        return cands
+        # salta i modelli appena falliti (403/404/429), ma se sono tutti in pausa li prova comunque
+        now = time.monotonic()
+        ready = [m for m in cands if self._cooldown.get(m, 0) <= now]
+        return ready or cands
+
+    # pausa dopo un errore: 403/404 = il modello non è utilizzabile con questa chiave, 429 = quota esaurita
+    COOLDOWN_S = {403: 3600, 404: 3600, 429: 60}
+
+    def _start_cooldown(self, model: str, status: int | None) -> None:
+        secs = self.COOLDOWN_S.get(status or 0)
+        if secs:
+            self._cooldown[model] = time.monotonic() + secs
 
     def _failed(self, model: str, e: Exception, tools, errors: list, t0: float, category):
         status = getattr(e, "status_code", None)
@@ -271,19 +286,21 @@ class Router:
         if tools and status in (400, 404):
             self._no_tools.add(model)
             label += " (tool nativi non supportati?)"
+        self._start_cooldown(model, status)
         errors.append(f"{model}: {label}")
         log.info("tentativo categoria=%s modello=%s esito=errore:%s ms=%d",
                  category, model, label, (time.monotonic() - t0) * 1000)
 
     def _complete(self, models: list[str], messages: list[dict], tools: list[dict] | None = None,
-                  vision: bool = False, use_global: bool = True, category: str | None = None):
+                  vision: bool = False, use_global: bool = True, category: str | None = None,
+                  tool_choice=None):
         """Prova i modelli in ordine; restituisce (modello, messaggio) con testo o tool_calls."""
         errors = []
         for model in self._candidates(models, tools, vision, use_global):
             t0 = time.monotonic()
             self._notify_attempt(model, category)
             try:
-                r = self._create(model, messages, tools)
+                r = self._create(model, messages, tools, tool_choice=tool_choice)
                 if not r.choices:
                     errors.append(f"{model}: risposta senza contenuto")
                     continue
@@ -298,7 +315,7 @@ class Router:
         raise RuntimeError("Tutti i modelli hanno fallito:\n  " + "\n  ".join(errors))
 
     def _stream(self, models: list[str], messages: list[dict], tools=None, vision: bool = False,
-                use_global: bool = True, category: str | None = None):
+                use_global: bool = True, category: str | None = None, tool_choice=None):
         """Generatore di eventi: ("start", modello), ("text", pezzo), infine ("final", modello, messaggio).
         Il fallback è possibile solo finché non è stato emesso testo; dopo, un errore interrompe la risposta."""
         errors = []
@@ -309,7 +326,7 @@ class Router:
             parts: list[str] = []
             calls: dict[int, dict] = {}
             try:
-                for chunk in self._create(model, messages, tools, stream=True):
+                for chunk in self._create(model, messages, tools, stream=True, tool_choice=tool_choice):
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -332,7 +349,7 @@ class Router:
                 continue
             content = "".join(parts)
             tool_calls = [
-                SimpleNamespace(id=c["id"] or f"call_{i}",
+                SimpleNamespace(id=c["id"] or f"call_{i}", index=i,
                                 function=SimpleNamespace(name=c["name"], arguments=c["arguments"]))
                 for i, c in sorted(calls.items())
             ]

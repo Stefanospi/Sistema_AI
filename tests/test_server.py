@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import del server PRIMA di importare router (il server usa import lazy)
 import server  # noqa: E402  # type: ignore
 
-from conftest import FakeClient, conn_error, msg  # noqa: E402
+from conftest import TEST_CONFIG, FakeClient, conn_error, msg, tool_call  # noqa: E402
 
 # Evita che il server tenti di caricare il Router reale durante i test
 from fastapi.testclient import TestClient  # noqa: E402
@@ -34,6 +34,7 @@ GLOBAL = "openrouter/free"
 def reset_router_singleton():
     """Resetta il singleton del router prima di ogni test."""
     server._router_instance = None
+    server.response_cache.clear()
     yield
     server._router_instance = None
 
@@ -49,6 +50,7 @@ def fake_router(tmp_path, monkeypatch):
     def make(script: dict):
         fc = FakeClient(script)
         r = Router(
+            config_path=TEST_CONFIG,
             client=fc,
             memory=Memory(tmp_path / "m.db"),
             log_file=tmp_path / "test.log",
@@ -243,3 +245,63 @@ def test_auth_senza_token_configurato_libero(fake_router, monkeypatch):
     client, _ = fake_router({})
     resp = client.get("/v1/models")
     assert resp.status_code == 200
+
+
+# ---------- regressioni: cache, tool_choice, origin, cooldown ----------
+
+def test_cache_hit_restituisce_la_stessa_risposta(fake_router):
+    """Seconda richiesta identica: servita dalla cache (prima dava 500) senza chiamare il modello."""
+    client, fc = fake_router({M1: [msg("una volta sola")]})
+    body = {"model": "router-coding", "messages": [{"role": "user", "content": "ciao"}]}
+    first = client.post("/v1/chat/completions", json=body)
+    second = client.post("/v1/chat/completions", json=body)
+    assert first.status_code == second.status_code == 200
+    assert second.json()["choices"][0]["message"]["content"] == "una volta sola"
+    assert len(fc.calls) == 1
+
+
+def test_tool_choice_inoltrato(fake_router):
+    tools = [{"type": "function", "function": {"name": "search", "description": "x", "parameters": {}}}]
+    client, fc = fake_router({M1: [msg("ok")]})
+    resp = client.post("/v1/chat/completions", json={
+        "model": "router-coding", "tools": tools, "tool_choice": "required",
+        "messages": [{"role": "user", "content": "cerca"}],
+    })
+    assert resp.status_code == 200
+    assert fc.calls[0]["tool_choice"] == "required"
+
+
+def test_tool_call_multipli_hanno_indici_distinti(fake_router):
+    calls = [tool_call("a", "{}", "c1"), tool_call("b", "{}", "c2")]
+    tools = [{"type": "function", "function": {"name": "a", "description": "x", "parameters": {}}}]
+    client, _ = fake_router({M1: [msg(None, calls)]})
+    resp = client.post("/v1/chat/completions", json={
+        "model": "router-coding", "tools": tools, "stream": True,
+        "messages": [{"role": "user", "content": "usa gli strumenti"}],
+    })
+    indexes = []
+    for line in resp.text.splitlines():
+        if line.startswith("data: {"):
+            for choice in json.loads(line[6:]).get("choices", []):
+                for tc in choice["delta"].get("tool_calls", []):
+                    indexes.append(tc["index"])
+    assert indexes == [0, 1]
+
+
+def test_richiesta_dal_browser_rifiutata(fake_router):
+    client, fc = fake_router({M1: [msg("no")]})
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Origin": "https://evil.example"},
+        json={"model": "router-coding", "messages": [{"role": "user", "content": "ciao"}]},
+    )
+    assert resp.status_code == 403
+    assert fc.calls == []
+
+
+def test_token_errato_rifiutato(fake_router, monkeypatch):
+    monkeypatch.setenv("ROUTER_API_TOKEN", "segreto")
+    client, _ = fake_router({})
+    assert client.get("/v1/models").status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer sbagliato"}).status_code == 401
+    assert client.get("/v1/models", headers={"Authorization": "Bearer segreto"}).status_code == 200

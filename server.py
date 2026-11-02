@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +26,7 @@ import uvicorn
 import yaml
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import APIError
@@ -60,12 +62,18 @@ def get_router():
 _bearer = HTTPBearer(auto_error=False)
 
 
-def check_token(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)):
-    """Se ROUTER_API_TOKEN è impostato in .env lo verifica; altrimenti lascia passare."""
+def check_token(request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)):
+    """Se ROUTER_API_TOKEN è impostato in .env lo verifica; altrimenti lascia passare.
+
+    Rifiuta sempre le richieste con header Origin: un browser lo manda sulle richieste cross-site,
+    editor e Capri no. Così una pagina web non può usare il router (e la tua quota) da 127.0.0.1."""
+    if request.headers.get("origin"):
+        raise HTTPException(status_code=403, detail="Richieste dal browser non consentite.")
     expected = os.getenv("ROUTER_API_TOKEN", "").strip()
     if not expected:
         return  # token non configurato: accesso libero (solo 127.0.0.1)
-    if credentials is None or credentials.credentials != expected:
+    if credentials is None or not secrets.compare_digest(
+            credentials.credentials.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Token non valido o mancante.")
 
 
@@ -207,6 +215,7 @@ def _proxy_complete(router, messages: list[dict], model: str,
             "model": model,
             "messages": messages,
             "tools": tools,
+            "tool_choice": tool_choice,
         })
         cached = response_cache.get(cache_key)
         if cached is not None:
@@ -218,7 +227,7 @@ def _proxy_complete(router, messages: list[dict], model: str,
     tool_schemas = tools if tools else None
     try:
         used_model, msg_obj = router._complete(
-            models_list, messages, tool_schemas, category=cat_name
+            models_list, messages, tool_schemas, category=cat_name, tool_choice=tool_choice
         )
     except RuntimeError as e:
         capri.failed(str(e))
@@ -261,7 +270,7 @@ def _proxy_complete(router, messages: list[dict], model: str,
     # Salva in cache se applicabile (nessuna tool_call)
     if cache_key is not None and not getattr(msg_obj, "tool_calls", None):
         try:
-            response_cache.set(cache_key, response.body if hasattr(response, 'body') else json.dumps(response.content).encode())
+            response_cache.set(cache_key, json.loads(response.body))
         except Exception:
             pass  # cache best-effort
 
@@ -269,7 +278,7 @@ def _proxy_complete(router, messages: list[dict], model: str,
 
 
 async def _proxy_stream(router, messages: list[dict], model: str,
-                        tools: list | None) -> AsyncGenerator[str, None]:
+                        tools: list | None, tool_choice: Any = None) -> AsyncGenerator[str, None]:
     """Proxy stream: genera SSE, con fallback prima del primo token."""
     models_list, cat_name = _resolve_models(router, model, messages)
     capri.prompt(_last_user_text(messages), cat_name)
@@ -279,7 +288,10 @@ async def _proxy_stream(router, messages: list[dict], model: str,
     parts: list[str] = []
     failed = False
     try:
-        for ev in router._stream(models_list, messages, tool_schemas, category=cat_name):
+        # _stream è sincrono e bloccante: lo si consuma in un thread per non fermare il server
+        async for ev in iterate_in_threadpool(
+                router._stream(models_list, messages, tool_schemas, category=cat_name,
+                               tool_choice=tool_choice)):
             if ev[0] == "start":
                 used_model = ev[1]
             elif ev[0] == "text":
@@ -290,7 +302,7 @@ async def _proxy_stream(router, messages: list[dict], model: str,
                 final_msg = ev[2]
                 # Se la risposta finale contiene tool_calls (stream), emettiamo chunk speciali
                 if getattr(final_msg, "tool_calls", None):
-                    for tc in final_msg.tool_calls:
+                    for i, tc in enumerate(final_msg.tool_calls):
                         tc_chunk = {
                             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
                             "object": "chat.completion.chunk",
@@ -301,7 +313,7 @@ async def _proxy_stream(router, messages: list[dict], model: str,
                                 "delta": {
                                     "role": "assistant",
                                     "tool_calls": [{
-                                        "index": 0,
+                                        "index": getattr(tc, "index", i),
                                         "id": tc.id,
                                         "type": "function",
                                         "function": {
@@ -438,7 +450,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _proxy_stream(router, messages, model, tools),
+            _proxy_stream(router, messages, model, tools, body.get("tool_choice")),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -446,7 +458,8 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        return _proxy_complete(router, messages, model, tools, body.get("tool_choice"))
+        return await run_in_threadpool(
+            _proxy_complete, router, messages, model, tools, body.get("tool_choice"))
 
 
 # ---------- avvio diretto ----------
