@@ -213,18 +213,35 @@ def test_proxy_stream_fallback_prima_del_testo(fake_router):
 
 def test_proxy_stream_router_auto_classifica(fake_router):
     """Con stream=True e router-auto, la classificazione avviene correttamente."""
-    LIGHT = "thinkingmachines/inkling-small:free"  # primo modello della cat. finanza in config
-    client, fc = fake_router({LIGHT: [msg("Risposta finanza")]})
+    LIGHT = "nvidia/nemotron-3.5-lightning:free"  # primo modello della cat. appunti in config
+    client, fc = fake_router({LIGHT: [msg("Risposta appunti")]})
     with client.stream("POST", "/v1/chat/completions", json={
         "model": "router-auto",
-        "messages": [{"role": "user", "content": "quanto rende un ETF?"}],
+        "messages": [{"role": "user", "content": "riassumi questi appunti della riunione"}],
         "stream": True,
     }) as resp:
         raw = resp.read().decode("utf-8")
 
     chunks = _parse_sse(raw)
     text_chunks = [c for c in chunks if c["choices"][0]["delta"].get("content")]
-    assert "".join(c["choices"][0]["delta"]["content"] for c in text_chunks) == "Risposta finanza"
+    assert "".join(c["choices"][0]["delta"]["content"] for c in text_chunks) == "Risposta appunti"
+
+
+def test_categoria_sensibile_non_parte_mai_verso_i_gratuiti(fake_router):
+    """Finanza e documenti: con la sezione brain attiva il percorso gratuito è chiuso."""
+    client, fc = fake_router({})
+    with client.stream("POST", "/v1/chat/completions", json={
+        "model": "router-auto",
+        "messages": [{"role": "user", "content": "quanto rende un ETF?"}],
+        "stream": True,
+    }) as resp:
+        raw = resp.read().decode("utf-8")
+    assert "solo Claude" in raw
+    assert fc.calls == []
+    r = client.post("/v1/chat/completions", json={
+        "model": "router-finanza", "messages": [{"role": "user", "content": "il mio budget"}]})
+    assert r.status_code == 502 and "solo Claude" in r.json()["error"]["message"]
+    assert fc.calls == []
 
 
 # ---------- autenticazione Bearer ----------
@@ -308,3 +325,41 @@ def test_token_errato_rifiutato(fake_router, monkeypatch):
     assert client.get("/v1/models").status_code == 401
     assert client.get("/v1/models", headers={"Authorization": "Bearer sbagliato"}).status_code == 401
     assert client.get("/v1/models", headers={"Authorization": "Bearer segreto"}).status_code == 200
+
+
+# ---------- conversione file ----------
+
+def test_convert_endpoint(fake_router, tmp_path):
+    from PIL import Image
+    client, _ = fake_router({})
+    server._router_instance.cfg["conversione"] = {"cartelle_consentite": [str(tmp_path)]}
+    src = tmp_path / "foto.png"
+    Image.new("RGB", (10, 10), "red").save(src)
+    r = client.post("/v1/convert", json={"path": str(src), "to": "jpg"})
+    assert r.status_code == 200 and r.json()["ok"]
+    assert Path(r.json()["output"]).name == "foto.jpg" and Path(r.json()["output"]).exists()
+    assert "Creato foto.jpg" in r.json()["message"]
+
+
+def test_convert_endpoint_errori_chiari(fake_router, tmp_path):
+    client, _ = fake_router({})
+    server._router_instance.cfg["conversione"] = {"cartelle_consentite": [str(tmp_path)]}
+    (tmp_path / "a.csv").write_text("a\n1\n", encoding="utf-8")
+    bad = client.post("/v1/convert", json={"path": str(tmp_path / "a.csv"), "to": "mp3"})
+    assert bad.status_code == 400 and "Da .csv posso arrivare a" in bad.json()["error"]["message"]
+    outside = client.post("/v1/convert", json={"path": str(Path(__file__)), "to": "txt"})
+    assert outside.status_code == 400 and "fuori dalle cartelle" in outside.json()["error"]["message"]
+    assert client.post("/v1/convert", json={"path": "", "to": "pdf"}).status_code == 422  # validazione FastAPI
+
+
+def test_convert_non_accetta_richieste_dal_browser(fake_router, tmp_path):
+    client, _ = fake_router({})
+    r = client.post("/v1/convert", headers={"Origin": "https://evil.example"},
+                    json={"path": str(tmp_path / "x.png"), "to": "jpg"})
+    assert r.status_code == 403
+
+
+def test_convert_formats(fake_router):
+    client, _ = fake_router({})
+    data = client.get("/v1/convert/formats").json()
+    assert "pdf" in data["docx"] and "jpg" in data["png"]

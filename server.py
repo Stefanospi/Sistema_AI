@@ -33,6 +33,7 @@ from openai import APIError
 from pydantic import BaseModel, Field
 
 import capri_bridge as capri
+import convert as converter
 from cache import response_cache, model_list_cache
 
 BASE_DIR = Path(__file__).parent
@@ -475,6 +476,29 @@ def reset_session(session: str = PathParam(pattern=SESSION_PATTERN)):
     """Dimentica la conversazione di una sessione (messaggi e riassunti)."""
     cleared = get_router().memory.clear(session)
     return {"session": session, "cleared": cleared}
+
+
+class ConvertRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    to: str = Field(min_length=1, max_length=8)
+
+
+@app.post("/v1/convert", dependencies=[Depends(check_token)])
+def convert_file(req: ConvertRequest):
+    """Converte un file con librerie Python (nessun modello, nessun token). Il risultato va accanto all'originale."""
+    cfg = get_router().cfg.get("conversione") or {}
+    try:
+        out = converter.convert(req.path, req.to, roots=cfg.get("cartelle_consentite") or None,
+                                max_mb=cfg.get("dimensione_max_mb", converter.MAX_MB_DEFAULT))
+    except converter.ConversionError as e:
+        return openai_error(400, str(e), "invalid_request_error")
+    return {"ok": True, "output": str(out), "message": f"Creato {out.name}"}
+
+
+@app.get("/v1/convert/formats", dependencies=[Depends(check_token)])
+def convert_formats():
+    """Formato di partenza -> formati di arrivo."""
+    return converter.supported()
 
 
 @app.post("/cache/clear", dependencies=[Depends(check_token)])

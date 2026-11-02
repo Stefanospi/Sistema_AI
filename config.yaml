@@ -117,7 +117,10 @@ categories:
 
 brain:               # cervello Claude (abbonamento Pro, via CLI `claude -p`)
   abilitato: true
-  modelli_gratuiti: false    # false = nessun prompt verso OpenRouter, mai (nemmeno come ripiego); true = ripiego ammesso, tranne categorie sensibili
+  modelli_gratuiti: true     # false = nessun prompt verso OpenRouter, mai. true = ammessi, ma mai per categorie sensibili né per lo schermo
+  instradamento:             # chi risponde per prima
+    gratuito: [appunti, generale, desktop]   # richieste semplici e non private di queste categorie: prima i gratuiti
+    soglia_caratteri: 500                    # più lunga di così (o con codice, o con una frase di "salita") = complessa: va a Claude
   claude:
     binario: ""              # vuoto = cerca da solo (CLAUDE_BIN, PATH, estensione VS Code)
     timeout_s: 120
@@ -144,3 +147,7 @@ brain:               # cervello Claude (abbonamento Pro, via CLI `claude -p`)
   quota_piano:               # quota REALE del piano Pro, comprende anche Claude Code: sopra soglia l'assistente si ferma
     finestra_5h_max: 0.5     # 0.5 = si ferma al 50% della finestra da 5 ore
     finestra_7g_max: 0.4     # 0.4 = si ferma al 40% di quella settimanale
+
+conversione:         # /converti in Capri e POST /v1/convert: librerie Python, nessun modello
+  cartelle_consentite: []    # vuoto = tutta la tua cartella utente; es. ["C:/Users/spita/Documents", "C:/Users/spita/Downloads"]
+  dimensione_max_mb: 50

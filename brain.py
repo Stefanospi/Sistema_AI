@@ -30,7 +30,9 @@ PLAN_WINDOWS = {"five_hour": ("finestra_5h_max", "da 5 ore"), "seven_day": ("fin
 
 DEFAULTS = {
     "abilitato": True,
-    "modelli_gratuiti": False,          # False = mai verso OpenRouter; True = ripiego ammesso (non per le categorie sensibili)
+    "modelli_gratuiti": False,          # False = mai verso OpenRouter; True = ammessi, ma mai per le categorie sensibili né per lo schermo
+    # richieste semplici e non private di queste categorie provano prima i modelli gratuiti; il resto va a Claude
+    "instradamento": {"gratuito": [], "soglia_caratteri": 500},
     "claude": {"binario": "", "timeout_s": 120, "max_per_richiesta_usd": 0.02, "max_token_output": 1500},
     "livelli": {"basso": "haiku", "medio": "sonnet", "alto": "opus"},
     "effort": {"basso": "low", "medio": "medium", "alto": "high"},
@@ -164,6 +166,16 @@ def _last_user_text(messages: list[dict]) -> str:
     return str(last or "")
 
 
+def _has_image(messages: list[dict]) -> bool:
+    return any(isinstance(m.get("content"), list)
+               and any(isinstance(p, dict) and p.get("type") != "text" for p in m["content"]) for m in messages)
+
+
+# motivi per cui una richiesta è andata a Claude e, se Claude non risponde, può ripiegare sui gratuiti.
+# Gli altri (livello scelto, immagini/schermo, categoria sensibile) restano su Claude o falliscono.
+FREE_FALLBACK_REASONS = {"categoria", "complesso", "semplice"}
+
+
 def _clip_middle(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -196,9 +208,31 @@ class Brain:
     def virtual_models(self) -> list[str]:
         return [AUTO] + [PREFIX + lv for lv in LEVELS] if self.cfg["abilitato"] else []
 
+    def _sensitive(self, category: str | None) -> bool:
+        return bool((self.router.cfg["categories"].get(category or "") or {}).get("sensibile"))
+
     def allow_free(self, category: str | None) -> bool:
-        sensitive = bool((self.router.cfg["categories"].get(category or "") or {}).get("sensibile"))
-        return bool(self.cfg["modelli_gratuiti"]) and not sensitive
+        return bool(self.cfg["modelli_gratuiti"]) and not self._sensitive(category)
+
+    def route(self, model: str, category: str | None, messages: list[dict]) -> tuple[str, str]:
+        """('claude' | 'gratuito', motivo). Privato, schermo, categorie impegnative e richieste complesse
+        vanno a Claude; le cose semplici e non private delle categorie elencate provano prima i gratuiti."""
+        if model.startswith(PREFIX) and model[len(PREFIX):] in LEVELS:
+            return "claude", "livello"
+        if _has_image(messages):
+            return "claude", "immagine"
+        if self._sensitive(category):
+            return "claude", "sensibile"
+        if not self.cfg["modelli_gratuiti"]:
+            return "claude", "solo-claude"
+        rules = self.cfg["instradamento"]
+        if category not in rules["gratuito"]:
+            return "claude", "categoria"
+        text = _last_user_text(messages)
+        if (len(text) > int(rules["soglia_caratteri"]) or "```" in text
+                or any(k.lower() in text.lower() for k in self.cfg["salita"])):
+            return "claude", "complesso"
+        return "gratuito", "semplice"
 
     # -- policy: livello e modello --
     def level(self, model: str, category: str | None, messages: list[dict]) -> str:
@@ -237,13 +271,40 @@ class Brain:
 
     # -- esecuzione --
     def stream(self, messages: list[dict], model: str, category: str | None = None):
-        """Stessi eventi di Router._stream. Un errore di Claude prima del primo testo ripiega sui modelli
-        gratuiti solo se consentiti (mai per le categorie sensibili); altrimenti viene sollevato."""
+        """Stessi eventi di Router._stream. La rotta decide chi risponde per prima (vedi route):
+        se tocca ai gratuiti e falliscono tutti prima del primo testo, si passa a Claude."""
+        engine, reason = self.route(model, category, messages)
+        if engine == "gratuito":
+            emitted = False
+            t0 = time.monotonic()
+            try:
+                for ev in self.router._stream(self._free_models(category), self.prepare(messages), None,
+                                              category=category):
+                    emitted = emitted or ev[0] == "text"
+                    yield ev
+                return
+            except RuntimeError as e:
+                log.info("brain categoria=%s rotta=gratuito esito=errore ms=%d: passo a Claude", category,
+                         (time.monotonic() - t0) * 1000)
+                if emitted:
+                    raise e
+        yield from self._stream_claude(messages, model, category, reason, tried_free=engine == "gratuito")
+
+    def _free_models(self, category: str | None) -> list[str]:
+        cats = self.router.cfg["categories"]
+        return cats.get(category or "", cats["generale"])["models"]
+
+    def _stream_claude(self, messages: list[dict], model: str, category: str | None, reason: str,
+                       tried_free: bool = False):
+        """Claude via CLI. Un errore prima del primo testo ripiega sui gratuiti solo se consentito
+        (non per categorie sensibili, schermo o livello scelto, e non se i gratuiti sono già falliti)."""
         level = self.level(model, category, messages)
         alias = self.cfg["livelli"][level]
         emitted, failure = False, None
         t0 = time.monotonic()
         try:
+            if _has_image(messages):
+                raise BackendError("Le immagini (schermo) arrivano con la fase 4: per ora Claude lavora solo sul testo.")
             self.budget.check()
             self.budget.check_plan(self.cfg["quota_piano"])
             prepared = self.prepare(messages)
@@ -255,20 +316,18 @@ class Brain:
                     u = getattr(ev[2], "usage", None) or {}
                     self.budget.record(ev[1], u.get("cost_usd", 0.0), u.get("input_tokens", 0), u.get("output_tokens", 0))
                     self.budget.record_plan(getattr(ev[2], "plan", None))
-                    log.info("brain categoria=%s livello=%s modello=%s esito=ok costo=%.5f tok_in=%d tok_out=%d ms=%d",
-                             category, level, ev[1], u.get("cost_usd", 0.0), u.get("input_tokens", 0),
+                    log.info("brain categoria=%s motivo=%s livello=%s modello=%s esito=ok costo=%.5f tok_in=%d tok_out=%d ms=%d",
+                             category, reason, level, ev[1], u.get("cost_usd", 0.0), u.get("input_tokens", 0),
                              u.get("output_tokens", 0), (time.monotonic() - t0) * 1000)
                 yield ev
             return
         except BackendError as e:
             failure = e
-            log.info("brain categoria=%s livello=%s esito=errore:%s ms=%d", category, level,
+            log.info("brain categoria=%s motivo=%s livello=%s esito=errore:%s ms=%d", category, reason, level,
                      e.__class__.__name__, (time.monotonic() - t0) * 1000)
-        if emitted or not self.allow_free(category):
+        if (emitted or tried_free or reason not in FREE_FALLBACK_REASONS or not self.allow_free(category)):
             raise failure
-        cats = self.router.cfg["categories"]
-        models = cats.get(category or "", cats["generale"])["models"]
-        yield from self.router._stream(models, messages, None, category=category)
+        yield from self.router._stream(self._free_models(category), messages, None, category=category)
 
     def complete(self, messages: list[dict], model: str, category: str | None = None):
         """(modello, messaggio) come Router._complete."""

@@ -584,3 +584,76 @@ def test_ask_con_immagini_non_usa_i_gratuiti(make_brain, tmp_path):
     with pytest.raises(RuntimeError, match="Modelli gratuiti disattivati"):
         router.ask("default", "che finestra e'?", category="desktop", images=[img])
     assert router.client.calls == []
+
+
+# ---------- rotta mista: gratuiti per il semplice e non privato, Claude per il resto ----------
+
+MIXED = {"modelli_gratuiti": True, "instradamento": {"gratuito": ["appunti", "generale", "desktop"], "soglia_caratteri": 100},
+         "salita": ["pensaci bene"]}
+LIGHT = "nvidia/nemotron-3.5-lightning:free"  # primo modello della categoria appunti nel config di test
+
+
+def ask(text, **extra):
+    return [{"role": "user", "content": text}]
+
+
+def test_rotta_semplice_non_privata_va_ai_gratuiti(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg=dict(MIXED))
+    assert brain.route("brain-auto", "appunti", ask("segna di chiamare Mario")) == ("gratuito", "semplice")
+    assert brain.route("brain-auto", "desktop", ask("come cambio lo sfondo?")) == ("gratuito", "semplice")
+
+
+def test_rotta_claude_per_privato_complesso_e_schermo(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg=dict(MIXED))
+    assert brain.route("brain-auto", "finanza", ask("ciao")) == ("claude", "sensibile")
+    assert brain.route("brain-auto", "documenti", ask("ciao")) == ("claude", "sensibile")
+    assert brain.route("brain-auto", "coding", ask("ciao")) == ("claude", "categoria")
+    assert brain.route("brain-auto", "appunti", ask("x" * 150)) == ("claude", "complesso")
+    assert brain.route("brain-auto", "appunti", ask("ecco ```codice```")) == ("claude", "complesso")
+    assert brain.route("brain-auto", "appunti", ask("pensaci bene")) == ("claude", "complesso")
+    assert brain.route("brain-medio", "appunti", ask("ciao")) == ("claude", "livello")
+    shot = [{"role": "user", "content": [{"type": "text", "text": "cosa vedi?"},
+                                         {"type": "image_url", "image_url": {"url": "data:..."}}]}]
+    assert brain.route("brain-auto", "appunti", shot) == ("claude", "immagine")
+
+
+def test_rotta_senza_gratuiti_e_sempre_claude(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"modelli_gratuiti": False})
+    assert brain.route("brain-auto", "appunti", ask("ciao")) == ("claude", "solo-claude")
+
+
+def test_semplice_risponde_il_gratuito_senza_toccare_claude(make_brain):
+    backend = StubBackend(ok_events())
+    brain, router = make_brain(backend, script={LIGHT: [msg("dal gratuito")]}, cfg=dict(MIXED))
+    model, message = brain.complete(ask("segna di chiamare Mario"), "brain-auto", "appunti")
+    assert model == LIGHT and message.content == "dal gratuito"
+    assert backend.aliases == [] and brain.budget.spent_today() == 0
+
+
+def test_gratuiti_falliti_si_passa_a_claude(make_brain):
+    from conftest import conn_error
+    backend = StubBackend(ok_events("risposta di claude"))
+    script = {LIGHT: [conn_error()], "google/gemma-4-26b-a4b-it:free": [conn_error()],
+              "dots-studio/dots-3-note-preview:free": [conn_error()], "openrouter/free": [conn_error()]}
+    brain, router = make_brain(backend, script=script, cfg=dict(MIXED))
+    model, message = brain.complete(ask("segna di chiamare Mario"), "brain-auto", "appunti")
+    assert message.content == "risposta di claude" and backend.aliases == ["haiku"]
+
+
+def test_complessa_va_a_claude_e_se_claude_cade_ripiega_sui_gratuiti(make_brain):
+    backend = StubBackend(error=BackendError("budget"))
+    brain, router = make_brain(backend, script={LIGHT: [msg("ripiego gratuito")]}, cfg=dict(MIXED))
+    model, message = brain.complete(ask("x" * 150), "brain-auto", "appunti")
+    assert backend.aliases == ["haiku"] and message.content == "ripiego gratuito"
+
+
+def test_schermo_e_livello_scelto_non_ripiegano_mai(make_brain):
+    backend = StubBackend(error=BackendError("budget"))
+    brain, router = make_brain(backend, script={LIGHT: [msg("NO")]}, cfg=dict(MIXED))
+    with pytest.raises(BackendError):
+        brain.complete(ask("ciao"), "brain-alto", "appunti")
+    shot = [{"role": "user", "content": [{"type": "text", "text": "cosa vedi?"},
+                                         {"type": "image_url", "image_url": {"url": "data:..."}}]}]
+    with pytest.raises(BackendError, match="fase 4"):
+        brain.complete(shot, "brain-auto", "appunti")
+    assert router.client.calls == []

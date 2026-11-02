@@ -305,10 +305,16 @@ class Router:
         log.info("tentativo categoria=%s modello=%s esito=errore:%s ms=%d",
                  category, model, label, (time.monotonic() - t0) * 1000)
 
+    def _guard_category(self, category: str | None) -> None:
+        """Con la sezione brain: attiva, i prompt delle categorie sensibili non partono mai verso i gratuiti."""
+        if self.cfg.get("brain") and category and (self.cfg["categories"].get(category) or {}).get("sensibile"):
+            raise RuntimeError(f"Categoria sensibile ({category}): solo Claude, mai i modelli gratuiti.")
+
     def _complete(self, models: list[str], messages: list[dict], tools: list[dict] | None = None,
                   vision: bool = False, use_global: bool = True, category: str | None = None,
                   tool_choice=None):
         """Prova i modelli in ordine; restituisce (modello, messaggio) con testo o tool_calls."""
+        self._guard_category(category)
         errors = []
         for model in self._candidates(models, tools, vision, use_global):
             t0 = time.monotonic()
@@ -332,6 +338,7 @@ class Router:
                 use_global: bool = True, category: str | None = None, tool_choice=None):
         """Generatore di eventi: ("start", modello), ("text", pezzo), infine ("final", modello, messaggio).
         Il fallback è possibile solo finché non è stato emesso testo; dopo, un errore interrompe la risposta."""
+        self._guard_category(category)
         errors = []
         for model in self._candidates(models, tools, vision, use_global):
             t0 = time.monotonic()

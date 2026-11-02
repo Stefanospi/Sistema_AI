@@ -471,8 +471,13 @@ Dalla fase 1 le richieste di solo testo passano da **Claude** (abbonamento, via 
 Tutto si regola nella sezione `brain:` di `config.yaml`.
 
 - **Modelli virtuali**: `brain-auto` (livello deciso dalla policy), `brain-basso` (Haiku), `brain-medio` (Sonnet), `brain-alto` (Opus).
-- **Niente modelli gratuiti**: con `brain.modelli_gratuiti: false` nessun prompt parte verso OpenRouter, nemmeno come ripiego;
-  `router-*` e gli ID OpenRouter vengono instradati a Claude. Le richieste con `tools` ricevono un errore chiaro.
+- **Rotta mista** (`brain.modelli_gratuiti: true`, `brain.instradamento`): le richieste semplici e non private delle categorie
+  elencate (`appunti`, `generale`, `desktop`) provano prima i modelli gratuiti; se falliscono tutti si passa a Claude.
+  Vanno **sempre a Claude**: categorie sensibili (`finanza`, `documenti`), immagini/schermo, livello scelto (`brain-medio`...),
+  categorie non elencate (es. `coding`) e richieste complesse (più lunghe di `soglia_caratteri`, con codice, o con una frase di `salita`).
+  Le categorie sensibili non arrivano ai gratuiti nemmeno scegliendo `router-finanza`: il router le rifiuta.
+- **Solo Claude**: con `brain.modelli_gratuiti: false` nessun prompt parte verso OpenRouter, mai; `router-*` e gli ID OpenRouter
+  vengono instradati a Claude. Le richieste con `tools` ricevono un errore chiaro.
 - **Consumi**: budget giornaliero e settimanale (prezzo di listino), soglie sulla quota reale del piano
   (`quota_piano`, comprende anche Claude Code), storico limitato (`limiti`), risposta concisa (`stile`), `--effort` per livello.
   `GET /stats` mostra spesa, residuo e ultime letture della quota.
@@ -484,3 +489,14 @@ Tutto si regola nella sezione `brain:` di `config.yaml`.
 - **CLI**: `python chat.py` usa lo stesso cervello per il testo. Immagini (`/img`) e agente (`--agente`) usano ancora i modelli gratuiti
   e con `modelli_gratuiti: false` danno errore.
 - **Binario**: la CLI viene cercata in `brain.claude.binario`, `CLAUDE_BIN`, PATH, estensione VS Code.
+
+## Conversione file (`convert.py`)
+
+Librerie Python, nessun modello e nessun token. Installazione: `pip install -r requirements-convert.txt`.
+
+- **Da Capri**: `/converti "C:\\percorso\\relazione.docx" pdf` e `/formati`. Il risultato va accanto all'originale e si apre in Esplora risorse.
+- **API**: `POST /v1/convert` con `{"path": ..., "to": "pdf"}`, `GET /v1/convert/formats`.
+- **Formati**: immagini (png, jpg, webp, bmp, gif, tiff, ico) tra loro e verso pdf; docx/md/txt/html tra loro e verso pdf (impaginazione
+  semplificata); pdf verso txt (non fa OCR); csv, xlsx, json, yaml tra loro dove ha senso.
+- **Sicurezza**: non sovrascrive mai (se esiste diventa `nome (1).pdf`); lavora solo in `conversione.cartelle_consentite` (di default la
+  tua cartella utente); rifiuta file con nome da segreto (`.env`, chiavi); limite `dimensione_max_mb`.
