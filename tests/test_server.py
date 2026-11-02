@@ -34,9 +34,11 @@ GLOBAL = "openrouter/free"
 def reset_router_singleton():
     """Resetta il singleton del router prima di ogni test."""
     server._router_instance = None
+    server._brain_instance = None
     server.response_cache.clear()
     yield
     server._router_instance = None
+    server._brain_instance = None
 
 
 @pytest.fixture
@@ -55,6 +57,7 @@ def fake_router(tmp_path, monkeypatch):
             memory=Memory(tmp_path / "m.db"),
             log_file=tmp_path / "test.log",
         )
+        r.cfg["brain"] = {"modelli_gratuiti": True}  # questi test provano il percorso gratuito (router-*)
         server._router_instance = r
         return TestClient(server.app, raise_server_exceptions=False), fc
 

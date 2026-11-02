@@ -112,3 +112,20 @@ def capri_spenta(request, monkeypatch):
     """Nei test Capri non riceve eventi veri (e non ne accoda in ritardo): solo test_capri_bridge li vuole."""
     if request.module.__name__ != "test_capri_bridge":
         monkeypatch.setenv("CAPRI_ENABLED", "0")
+
+
+import backends  # noqa: E402
+
+REAL_FIND_CLAUDE_BIN = backends.find_claude_bin
+
+
+@pytest.fixture(autouse=True)
+def mai_la_cli_vera(monkeypatch):
+    """Nessun test deve lanciare la CLI di Claude vera (consuma la quota del piano):
+    solo un percorso passato esplicitamente (i test usano un sottoprocesso finto) viene accettato."""
+    def guarded(configured: str = "") -> str:
+        if configured:
+            return configured
+        raise backends.BackendError("CLI di Claude disattivata nei test.")
+
+    monkeypatch.setattr(backends, "find_claude_bin", guarded)

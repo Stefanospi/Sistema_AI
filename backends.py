@@ -76,28 +76,34 @@ class ClaudeCliBackend:
         self.binary = cfg.get("binario", "")
         self.timeout = float(cfg.get("timeout_s", 120))
         self.max_budget = cfg.get("max_per_richiesta_usd", 0.05)
+        # freno anti-fuga: oltre questo la CLI interrompe con un errore (non tronca), quindi va tenuto alto
+        self.max_output = int(cfg.get("max_token_output", 1500))
         self._popen = popen
         # cartella neutra: la CLI non deve leggere CLAUDE.md né file di un progetto qualsiasi
         self.cwd = str(Path(tempfile.gettempdir()))
 
-    def _argv(self, alias: str, system: str) -> list[str]:
+    def _argv(self, alias: str, system: str, effort: str | None) -> list[str]:
         argv = [find_claude_bin(self.binary), "-p", "--model", alias,
                 "--output-format", "stream-json", "--include-partial-messages", "--verbose",
                 "--no-session-persistence", "--tools", "", "--safe-mode"]
+        if effort:
+            argv += ["--effort", effort]
         if self.max_budget:
             argv += ["--max-budget-usd", str(self.max_budget)]
         if system.strip():
             argv += ["--system-prompt", system]
         return argv
 
-    def stream(self, messages: list[dict], alias: str):
+    def stream(self, messages: list[dict], alias: str, effort: str | None = None):
         system, prompt = build_prompt(messages)
         if not prompt.strip():
             raise BackendError("Nessun messaggio utente da inviare.")
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        if self.max_output:
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(self.max_output)
         label = f"claude/{alias}"
         try:
-            proc = self._popen(self._argv(alias, system), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            proc = self._popen(self._argv(alias, system, effort), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                cwd=self.cwd, env=env)
         except OSError as e:
@@ -110,7 +116,7 @@ class ClaudeCliBackend:
 
         timer = threading.Timer(self.timeout, expire)
         timer.start()
-        emitted, result, tail = False, None, []
+        emitted, result, tail, plan = False, None, [], {}
         try:
             try:
                 proc.stdin.write(prompt)
@@ -135,6 +141,12 @@ class ClaudeCliBackend:
                             emitted = True
                             yield ("start", label)
                         yield ("text", delta.get("text", ""))
+                elif kind == "rate_limit_event":
+                    # utilizzo reale del piano (finestre da 5 ore e da 7 giorni, comprende anche Claude Code)
+                    windows = (ev.get("rate_limit_info") or {}).get("unifiedWindows") or {}
+                    plan = {k: {"utilization": float(w.get("utilization") or 0),
+                                "resets_at": float(w.get("resetsAt") or 0)}
+                            for k, w in windows.items() if isinstance(w, dict)} or plan
                 elif kind == "result":
                     result = ev
             proc.wait()
@@ -149,6 +161,8 @@ class ClaudeCliBackend:
         if result.get("is_error"):
             raise BackendError(str(result.get("result") or result.get("subtype") or "errore della CLI di Claude"))
         text = str(result.get("result") or "")
+        if text.startswith("API Error:"):  # es. superato il tetto di token di output
+            raise BackendError(text)
         if not emitted:
             yield ("start", label)
             if text:
@@ -160,4 +174,5 @@ class ClaudeCliBackend:
                    "input_tokens": int(usage.get("input_tokens") or 0)
                    + int(usage.get("cache_creation_input_tokens") or 0)
                    + int(usage.get("cache_read_input_tokens") or 0),
-                   "output_tokens": int(usage.get("output_tokens") or 0)}))
+                   "output_tokens": int(usage.get("output_tokens") or 0)},
+            plan=plan))

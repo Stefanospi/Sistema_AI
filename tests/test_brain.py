@@ -12,7 +12,7 @@ import backends  # noqa: E402
 import brain as brain_mod  # noqa: E402
 from backends import BackendError, ClaudeCliBackend, build_prompt  # noqa: E402
 from brain import Brain, Budget, BudgetExceeded  # noqa: E402
-from conftest import msg  # noqa: E402
+from conftest import REAL_FIND_CLAUDE_BIN, msg  # noqa: E402
 
 M1 = "nvidia/nemotron-3.5-super-vl:free"
 
@@ -141,7 +141,7 @@ def test_binario_assente(monkeypatch):
     monkeypatch.setattr(backends.Path, "home", lambda: Path("Z:/non/esiste"))
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
     with pytest.raises(BackendError, match="non trovata"):
-        backends.find_claude_bin("")
+        REAL_FIND_CLAUDE_BIN("")
 
 
 # ---------- Budget ----------
@@ -154,7 +154,7 @@ def test_budget_conta_e_blocca(tmp_path):
     b.record("claude/haiku", 0.006)
     with pytest.raises(BudgetExceeded):
         b.check()
-    assert b.status()["remaining_usd"] == 0
+    assert b.status()["remaining_today_usd"] == 0
 
 
 def test_budget_riparte_il_giorno_dopo(tmp_path):
@@ -176,10 +176,12 @@ def test_budget_non_crea_file_se_non_usato(tmp_path):
 
 class StubBackend:
     def __init__(self, events=None, error=None):
-        self.events, self.error, self.aliases = events, error, []
+        self.events, self.error, self.aliases, self.efforts, self.sent = events, error, [], [], []
 
-    def stream(self, messages, alias):
+    def stream(self, messages, alias, effort=None):
         self.aliases.append(alias)
+        self.efforts.append(effort)
+        self.sent.append(messages)
         if self.error:
             raise self.error
         yield from self.events
@@ -197,7 +199,6 @@ def make_brain(make_router, tmp_path):
     def factory(backend, script=None, cfg=None, daily=1.0):
         router = make_router(script or {})
         cfg = cfg if cfg is not None else {}
-        cfg.setdefault("budget", {"giornaliero_usd": daily})
         return Brain(router, backend=backend, budget=Budget(tmp_path / "u.db", daily), cfg=cfg), router
 
     return factory
@@ -224,11 +225,12 @@ def test_per_categoria_e_salita(make_brain):
                        [{"role": "user", "content": "pensaci bene"}]) == "medio"
 
 
-def test_handles_solo_brain_senza_tool(make_brain):
+def test_handles_senza_gratuiti_prende_tutto_tranne_i_tool(make_brain):
     brain, _ = make_brain(StubBackend(ok_events()))
     assert brain.handles("brain-auto", None)
+    assert brain.handles("router-coding", None)          # niente free: va a Claude
+    assert brain.handles("google/gemma-4-31b-it:free", None)
     assert not brain.handles("brain-auto", [{"type": "function"}])
-    assert not brain.handles("router-auto", None)
     brain.cfg["abilitato"] = False
     assert not brain.handles("brain-auto", None)
 
@@ -243,16 +245,16 @@ def test_usa_l_alias_del_livello_e_registra_il_costo(make_brain):
     assert brain.budget.spent_today() == pytest.approx(0.004)
 
 
-def test_errore_della_cli_ripiega_sul_router_gratuito(make_brain):
+def test_errore_della_cli_ripiega_sul_router_gratuito_solo_se_consentito(make_brain):
     backend = StubBackend(error=BackendError("CLI assente"))
-    brain, router = make_brain(backend, script={M1: [msg("dal gratuito")]})
+    brain, router = make_brain(backend, script={M1: [msg("dal gratuito")]}, cfg={"modelli_gratuiti": True})
     model, message = brain.complete(USER, "brain-auto", "generale")
     assert model == M1 and message.content == "dal gratuito"
 
 
 def test_budget_finito_ripiega_senza_chiamare_claude(make_brain):
     backend = StubBackend(ok_events())
-    brain, _ = make_brain(backend, script={M1: [msg("gratis")]}, daily=0.01)
+    brain, _ = make_brain(backend, script={M1: [msg("gratis")]}, daily=0.01, cfg={"modelli_gratuiti": True})
     brain.budget.record("claude/haiku", 0.5)
     model, message = brain.complete(USER, "brain-auto", "generale")
     assert backend.aliases == [] and message.content == "gratis"
@@ -260,12 +262,12 @@ def test_budget_finito_ripiega_senza_chiamare_claude(make_brain):
 
 def test_errore_dopo_il_primo_testo_non_ripiega(make_brain):
     class Breaks:
-        def stream(self, messages, alias):
+        def stream(self, messages, alias, effort=None):
             yield ("start", "claude/haiku")
             yield ("text", "inizio")
             raise BackendError("interrotto")
 
-    brain, router = make_brain(Breaks(), script={M1: [msg("non deve servire")]})
+    brain, router = make_brain(Breaks(), script={M1: [msg("non deve servire")]}, cfg={"modelli_gratuiti": True})
     with pytest.raises(BackendError, match="interrotto"):
         list(brain.stream(USER, "brain-auto", "generale"))
     assert router.client.calls == []
@@ -295,7 +297,171 @@ def test_server_brain_non_stream_e_stream(make_brain):
 
         ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
         assert {"brain-auto", "brain-basso", "brain-medio", "brain-alto"} <= set(ids)
-        assert "spent_usd" in client.get("/stats").json()["brain"]
+        assert "spent_today_usd" in client.get("/stats").json()["brain"]
+    finally:
+        server._router_instance = server._brain_instance = None
+        server.response_cache.clear()
+
+
+# ---------- politica: niente modelli gratuiti, privacy, consumi ----------
+
+def test_handles_con_gratuiti_consentiti_solo_brain(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"modelli_gratuiti": True})
+    assert brain.handles("brain-basso", None)
+    assert not brain.handles("router-coding", None)
+
+
+def test_senza_gratuiti_l_errore_non_ripiega_mai(make_brain):
+    backend = StubBackend(error=BackendError("CLI assente"))
+    brain, router = make_brain(backend, script={M1: [msg("non deve partire")]})
+    with pytest.raises(BackendError, match="CLI assente"):
+        brain.complete(USER, "brain-auto", "generale")
+    assert router.client.calls == []
+
+
+def test_categoria_sensibile_non_va_mai_sui_gratuiti(make_brain):
+    backend = StubBackend(error=BackendError("CLI assente"))
+    brain, router = make_brain(backend, script={M1: [msg("no")]}, cfg={"modelli_gratuiti": True})
+    assert brain.allow_free("generale") and not brain.allow_free("finanza")
+    with pytest.raises(BackendError):
+        brain.complete(USER, "brain-auto", "finanza")
+    assert router.client.calls == []
+
+
+def test_router_rifiuta_i_gratuiti_se_disattivati(make_router):
+    r = make_router({M1: [msg("no")]})
+    r.cfg["brain"] = {"modelli_gratuiti": False}
+    with pytest.raises(RuntimeError, match="Modelli gratuiti disattivati"):
+        r._complete([M1], USER)
+    assert r.client.calls == []
+
+
+def test_effort_segue_il_livello(make_brain):
+    backend = StubBackend(ok_events())
+    brain, _ = make_brain(backend)
+    brain.complete(USER, "brain-basso", "generale")
+    brain.complete(USER, "brain-alto", "generale")
+    assert backend.efforts == ["low", "high"]
+
+
+def test_quota_del_piano_blocca_sopra_soglia(make_brain):
+    import time
+    backend = StubBackend(ok_events())
+    brain, _ = make_brain(backend, cfg={"quota_piano": {"finestra_5h_max": 0.5}})
+    brain.budget.record_plan({"five_hour": {"utilization": 0.62, "resets_at": time.time() + 3600}})
+    with pytest.raises(brain_mod.QuotaExceeded, match="62%"):
+        brain.complete(USER, "brain-auto", "generale")
+    assert backend.aliases == []
+
+
+def test_quota_scaduta_non_blocca(make_brain):
+    import time
+    backend = StubBackend(ok_events())
+    brain, _ = make_brain(backend)
+    brain.budget.record_plan({"five_hour": {"utilization": 0.99, "resets_at": time.time() - 10}})
+    assert brain.complete(USER, "brain-auto", "generale")[1].content
+
+
+def test_dopo_la_risposta_salva_la_quota_letta(make_brain):
+    import time
+    from types import SimpleNamespace
+    plan = {"five_hour": {"utilization": 0.3, "resets_at": time.time() + 600}}
+    events = [("start", "claude/x"), ("text", "ok"),
+              ("final", "claude/x", SimpleNamespace(content="ok", tool_calls=None, plan=plan,
+                                                     usage={"cost_usd": 0.001, "input_tokens": 1, "output_tokens": 1}))]
+    brain, _ = make_brain(StubBackend(events))
+    brain.complete(USER, "brain-auto", "generale")
+    assert brain.budget.plan_state()["five_hour"]["utilization"] == 0.3
+
+
+def test_budget_settimanale(tmp_path):
+    b = Budget(tmp_path / "u.db", daily_usd=0, weekly_usd=0.01)
+    b.record("m", 0.02)
+    with pytest.raises(BudgetExceeded, match="settimanale"):
+        b.check()
+
+
+def test_prepare_taglia_storico_e_aggiunge_stile(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"limiti": {"max_messaggi_storico": 3}})
+    msgs = [{"role": "system", "content": "Sei un assistente"}]
+    for i in range(5):
+        msgs += [{"role": "user", "content": f"u{i}"}, {"role": "assistant", "content": f"a{i}"}]
+    msgs.append({"role": "user", "content": "ultima"})
+    out = brain.prepare(msgs)
+    assert out[0]["role"] == "system" and "Sei un assistente" in out[0]["content"] and "conciso" in out[0]["content"]
+    assert out[-1]["content"] == "ultima"
+    assert out[1]["role"] != "assistant"           # niente risposta orfana in testa
+    assert len(out) - 1 <= 3
+
+
+def test_prepare_rispetta_il_limite_di_caratteri(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"limiti": {"max_caratteri_prompt": 100}})
+    msgs = [{"role": "user", "content": "x" * 80}, {"role": "assistant", "content": "y" * 80},
+            {"role": "user", "content": "ultima domanda"}]
+    out = brain.prepare(msgs)
+    assert out[-1]["content"] == "ultima domanda" and len(out) <= 3
+    big = brain.prepare([{"role": "user", "content": "z" * 1000}])
+    assert len(big[-1]["content"]) < 400 and "omessi" in big[-1]["content"]
+
+
+def test_prepare_viene_applicato_prima_del_backend(make_brain):
+    backend = StubBackend(ok_events())
+    brain, _ = make_brain(backend)
+    brain.complete([{"role": "user", "content": "ciao"}], "brain-auto", "generale")
+    assert backend.sent[0][0]["role"] == "system" and "conciso" in backend.sent[0][0]["content"]
+
+
+# ---------- backend: quota, effort, tetto di output ----------
+
+def rate(five=0.07, seven=0.03):
+    return json.dumps({"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
+        "five_hour": {"utilization": five, "resetsAt": 1793669400, "status": "allowed"},
+        "seven_day": {"utilization": seven, "resetsAt": 1793772000, "status": "allowed"}}}}) + "\n"
+
+
+def test_backend_legge_la_quota_dal_flusso():
+    events = list(backend_with(FakeProc([rate(0.07, 0.03), delta("ok"), result("ok")])).stream(USER, "haiku"))
+    plan = events[-1][2].plan
+    assert plan["five_hour"] == {"utilization": 0.07, "resets_at": 1793669400.0}
+    assert plan["seven_day"]["utilization"] == 0.03
+
+
+def test_backend_effort_e_tetto_output():
+    seen = []
+    list(backend_with(FakeProc([delta("x"), result("x")]), seen).stream(USER, "haiku", effort="low"))
+    argv, env = seen[0]["argv"], seen[0]["env"]
+    assert argv[argv.index("--effort") + 1] == "low"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "1500"
+
+
+def test_backend_api_error_del_tetto_diventa_errore():
+    proc = FakeProc([result("API Error: Claude's response exceeded the 1500 output token maximum.")])
+    with pytest.raises(BackendError, match="exceeded"):
+        list(backend_with(proc).stream(USER, "haiku"))
+
+
+# ---------- server: router-* senza gratuiti va a Claude ----------
+
+def test_server_router_coding_senza_gratuiti_usa_claude(make_brain):
+    import server
+    from fastapi.testclient import TestClient
+
+    backend = StubBackend(ok_events("da claude"))
+    brain, router = make_brain(backend, script={M1: [msg("NON deve servire")]})
+    server._router_instance, server._brain_instance = router, brain
+    server.response_cache.clear()
+    try:
+        client = TestClient(server.app, raise_server_exceptions=False)
+        r = client.post("/v1/chat/completions", json={"model": "router-coding", "messages": USER})
+        assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "da claude"
+        assert router.client.calls == []
+        # con strumenti: la CLI non puo' e i gratuiti sono spenti -> errore chiaro, nessuna fuga
+        router.cfg["brain"] = {"modelli_gratuiti": False}
+        t = client.post("/v1/chat/completions", json={
+            "model": "router-coding", "messages": USER,
+            "tools": [{"type": "function", "function": {"name": "x", "description": "x", "parameters": {}}}]})
+        assert t.status_code == 502 and "gratuiti disattivati" in t.json()["error"]["message"]
+        assert router.client.calls == []
     finally:
         server._router_instance = server._brain_instance = None
         server.response_cache.clear()

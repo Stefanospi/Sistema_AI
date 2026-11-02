@@ -253,6 +253,10 @@ class Router:
             capri.attempt(model)
 
     def _candidates(self, models: list[str], tools, vision: bool, use_global: bool) -> list[str]:
+        # interruttore generale: con brain.modelli_gratuiti: false nessun prompt parte verso OpenRouter
+        if (self.cfg.get("brain") or {}).get("modelli_gratuiti", True) is False:
+            raise RuntimeError("Modelli gratuiti disattivati (brain.modelli_gratuiti: false in config.yaml): "
+                               "usa i modelli brain-* (Claude).")
         cands = list(models)
         if use_global and not vision:
             cands.append(self.cfg["fallback_globale"])
