@@ -105,3 +105,10 @@ def make_router(tmp_path):
     factory.sleeps = sleeps
     factory.log_path = tmp_path / "test.log"
     return factory
+
+
+@pytest.fixture(autouse=True)
+def capri_spenta(request, monkeypatch):
+    """Nei test Capri non riceve eventi veri (e non ne accoda in ritardo): solo test_capri_bridge li vuole."""
+    if request.module.__name__ != "test_capri_bridge":
+        monkeypatch.setenv("CAPRI_ENABLED", "0")

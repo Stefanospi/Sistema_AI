@@ -114,3 +114,19 @@ categories:
     keywords: []
     system: >
       Sei un assistente generale. Rispondi in italiano, in modo chiaro e conciso.
+
+brain:               # cervello Claude (abbonamento, via CLI `claude -p`); se non risponde si ripiega sui modelli gratuiti
+  abilitato: true
+  claude:
+    binario: ""              # vuoto = cerca da solo (CLAUDE_BIN, PATH, estensione VS Code)
+    timeout_s: 120
+    max_per_richiesta_usd: 0.05   # tetto per singola chiamata (prezzo di listino)
+  livelli:                   # livello -> alias del modello
+    basso: haiku
+    medio: sonnet
+    alto: opus
+  livello_default: basso     # usato da brain-auto
+  per_categoria: {}          # es. { coding: medio } per alzare il livello di una categoria
+  salita: ["pensaci bene", "approfondisci", "più accurato", "ragiona a fondo"]   # frasi che alzano di un livello
+  budget:
+    giornaliero_usd: 1.0     # a prezzo di listino; superato, brain-* ripiega sui modelli gratuiti

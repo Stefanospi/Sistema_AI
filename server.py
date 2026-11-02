@@ -46,6 +46,16 @@ log = logging.getLogger("airouter.server")
 # ---------- avvio lazy del router ----------
 
 _router_instance = None
+_brain_instance = None
+
+
+def get_brain():
+    """Cervello Claude (policy + budget + CLI), creato al primo uso sopra il router."""
+    global _brain_instance
+    if _brain_instance is None:
+        from brain import Brain
+        _brain_instance = Brain(get_router())
+    return _brain_instance
 
 
 def get_router():
@@ -226,9 +236,13 @@ def _proxy_complete(router, messages: list[dict], model: str,
 
     tool_schemas = tools if tools else None
     try:
-        used_model, msg_obj = router._complete(
-            models_list, messages, tool_schemas, category=cat_name, tool_choice=tool_choice
-        )
+        brain = get_brain()
+        if brain.handles(model, tools):
+            used_model, msg_obj = brain.complete(messages, model, cat_name)
+        else:
+            used_model, msg_obj = router._complete(
+                models_list, messages, tool_schemas, category=cat_name, tool_choice=tool_choice
+            )
     except RuntimeError as e:
         capri.failed(str(e))
         return openai_error(502, str(e))
@@ -289,9 +303,11 @@ async def _proxy_stream(router, messages: list[dict], model: str,
     failed = False
     try:
         # _stream è sincrono e bloccante: lo si consuma in un thread per non fermare il server
-        async for ev in iterate_in_threadpool(
-                router._stream(models_list, messages, tool_schemas, category=cat_name,
-                               tool_choice=tool_choice)):
+        brain = get_brain()
+        source = (brain.stream(messages, model, cat_name) if brain.handles(model, tools)
+                  else router._stream(models_list, messages, tool_schemas, category=cat_name,
+                                      tool_choice=tool_choice))
+        async for ev in iterate_in_threadpool(source):
             if ev[0] == "start":
                 used_model = ev[1]
             elif ev[0] == "text":
@@ -370,6 +386,12 @@ def list_models():
         "owned_by": "ai-router",
         "description": "Classifica automaticamente la richiesta e sceglie il modello migliore.",
     })
+    # modelli Claude: brain-auto (policy) e un livello fisso ciascuno
+    for vid in get_brain().virtual_models():
+        models.append({
+            "id": vid, "object": "model", "created": now, "owned_by": "ai-router",
+            "description": "Claude via abbonamento, con ripiego sui modelli gratuiti.",
+        })
     # un modello virtuale per ogni categoria
     for cat in cats:
         models.append({
@@ -405,7 +427,8 @@ def stats():
         "model_list_cache": model_list_cache.stats(),
         "categories": cats,
         "fallback_globale": router.cfg.get("fallback_globale"),
-        "virtual_models": ["router-auto"] + [f"router-{c}" for c in cats],
+        "virtual_models": ["router-auto"] + [f"router-{c}" for c in cats] + get_brain().virtual_models(),
+        "brain": get_brain().status(),
     }
 
 
