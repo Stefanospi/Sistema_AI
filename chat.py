@@ -6,6 +6,7 @@ from pathlib import Path
 
 import requests
 
+from brain import Brain
 from router import Router, all_model_ids
 from tools import Toolbox
 
@@ -33,6 +34,7 @@ def main():
         return
 
     router = Router()
+    Brain(router)  # le richieste di solo testo passano da Claude (vedi brain: in config.yaml)
     cats = list(router.cfg["categories"])
 
     try:

@@ -25,7 +25,7 @@ from typing import Any, AsyncGenerator
 import uvicorn
 import yaml
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Request
 from fastapi.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -120,8 +120,13 @@ class ChatMessage(BaseModel):
     content: str | list | None = None
 
 
+SESSION_PATTERN = r"^[\w.-]{1,64}$"
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = AUTO_MODEL
+    # sessione lato server: il client manda solo il nuovo messaggio, la cronologia sta nella memoria del router
+    session: str | None = Field(default=None, pattern=SESSION_PATTERN)
     messages: list[ChatMessage] = Field(min_length=1)
     tools: list | None = None
     tool_choice: Any = None
@@ -158,6 +163,28 @@ def _last_user_text(messages: list[dict]) -> str:
     if isinstance(last, list):
         last = " ".join(p.get("text", "") for p in last if isinstance(p, dict))
     return str(last or "")
+
+
+# ---------- sessioni (memoria unica lato server) ----------
+
+def _session_messages(router, session: str, messages: list[dict]) -> list[dict]:
+    """Messaggio di sistema del client + riassunto + cronologia salvata + nuovo messaggio utente."""
+    system = [m for m in messages if m.get("role") == "system"]
+    summary = router.memory.summary(session)
+    if summary:
+        system.append({"role": "system", "content": "Riassunto della conversazione precedente:\n" + summary})
+    history = [{"role": r, "content": c} for _, r, c in router.memory.active(session)]
+    return system + history + [messages[-1]]
+
+
+def _remember(router, session: str, text: str, answer: str, category: str) -> None:
+    """Salva lo scambio e, se la sessione è lunga, la riassume (con Claude, livello basso)."""
+    try:
+        router.memory.add(session, "user", text, category)
+        router.memory.add(session, "assistant", answer, category)
+        router._maybe_compact(session)
+    except Exception:
+        log.exception("salvataggio sessione fallito")
 
 
 # ---------- helper: chiave cache per richiesta ----------
@@ -216,11 +243,14 @@ def _build_chunk(model_used: str, content: str | None, finish_reason: str | None
 # ---------- modalità PROXY ----------
 
 def _proxy_complete(router, messages: list[dict], model: str,
-                    tools: list | None, tool_choice: Any) -> JSONResponse:
+                    tools: list | None, tool_choice: Any, session: str | None = None) -> JSONResponse:
     """Proxy non-stream: sceglie il modello reale e inoltra la richiesta invariata."""
-    # Chiave cache (solo se non ci sono tool, per evitare effetti collaterali)
+    # Chiave cache (solo se non ci sono tool, per evitare effetti collaterali; mai con una sessione)
+    new_text = _last_user_text(messages)
+    if session:
+        messages = _session_messages(router, session, messages)
     cache_key = None
-    if not tools:
+    if not tools and not session:
         cache_key = _cache_key({
             "model": model,
             "messages": messages,
@@ -250,6 +280,8 @@ def _proxy_complete(router, messages: list[dict], model: str,
         capri.failed(str(e))
         return openai_error(getattr(e, "status_code", 502) or 502, str(e))
     capri.done(getattr(msg_obj, "content", "") or "")
+    if session and not getattr(msg_obj, "tool_calls", None):
+        _remember(router, session, new_text, (msg_obj.content or "").strip(), cat_name)
 
     # Gestione tool_calls nella risposta
     if getattr(msg_obj, "tool_calls", None):
@@ -292,9 +324,13 @@ def _proxy_complete(router, messages: list[dict], model: str,
 
 
 async def _proxy_stream(router, messages: list[dict], model: str,
-                        tools: list | None, tool_choice: Any = None) -> AsyncGenerator[str, None]:
+                        tools: list | None, tool_choice: Any = None,
+                        session: str | None = None) -> AsyncGenerator[str, None]:
     """Proxy stream: genera SSE, con fallback prima del primo token."""
+    new_text = _last_user_text(messages)
     models_list, cat_name = _resolve_models(router, model, messages)
+    if session:
+        messages = _session_messages(router, session, messages)
     capri.prompt(_last_user_text(messages), cat_name)
 
     tool_schemas = tools if tools else None
@@ -316,6 +352,8 @@ async def _proxy_stream(router, messages: list[dict], model: str,
             elif ev[0] == "final":
                 used_model = ev[1]
                 final_msg = ev[2]
+                if session and not getattr(final_msg, "tool_calls", None):
+                    await run_in_threadpool(_remember, router, session, new_text, "".join(parts).strip(), cat_name)
                 # Se la risposta finale contiene tool_calls (stream), emettiamo chunk speciali
                 if getattr(final_msg, "tool_calls", None):
                     for i, tc in enumerate(final_msg.tool_calls):
@@ -432,6 +470,13 @@ def stats():
     }
 
 
+@app.post("/v1/sessions/{session}/reset", dependencies=[Depends(check_token)])
+def reset_session(session: str = PathParam(pattern=SESSION_PATTERN)):
+    """Dimentica la conversazione di una sessione (messaggi e riassunti)."""
+    cleared = get_router().memory.clear(session)
+    return {"session": session, "cleared": cleared}
+
+
 @app.post("/cache/clear", dependencies=[Depends(check_token)])
 def clear_cache():
     """Svuota la cache delle risposte."""
@@ -470,10 +515,14 @@ async def chat_completions(request: Request):
         return openai_error(400, "Il campo 'messages' è obbligatorio e non può essere vuoto.", "invalid_request_error")
 
     router = get_router()
+    session = validated.session
+    if session and not get_brain().handles(model, tools):
+        return openai_error(400, "session è supportato solo con i modelli Claude (brain-*), senza strumenti.",
+                            "invalid_request_error")
 
     if stream:
         return StreamingResponse(
-            _proxy_stream(router, messages, model, tools, body.get("tool_choice")),
+            _proxy_stream(router, messages, model, tools, body.get("tool_choice"), session),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -482,7 +531,7 @@ async def chat_completions(request: Request):
         )
     else:
         return await run_in_threadpool(
-            _proxy_complete, router, messages, model, tools, body.get("tool_choice"))
+            _proxy_complete, router, messages, model, tools, body.get("tool_choice"), session)
 
 
 # ---------- avvio diretto ----------

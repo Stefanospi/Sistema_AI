@@ -37,13 +37,24 @@ def test_sequenza_eventi(monkeypatch):
     capri.done("tutto ok")
     _flush()
     srv.shutdown()
-    assert [e["hook_event_name"] for e in events] == ["UserPromptSubmit", "PreToolUse", "PreToolUse", "Stop"]
+    assert [e["type"] for e in events] == ["request.start", "model.attempt", "tool.call", "done"]
     assert events[0]["prompt"] == "ciao come stai"
-    assert events[0]["session_title"] == "router · coding"
-    assert events[1]["tool_name"] == "mcp__router__nvidia/nemotron:free"
-    assert events[2]["tool_input"] == {"path": "a.py"}
-    assert events[3]["last_assistant_message"] == "tutto ok"
-    assert all(e["session_id"] == "router" for e in events)
+    assert events[0]["title"] == "router · coding"
+    assert events[1]["model"] == "nvidia/nemotron:free"
+    assert events[2]["name"] == "read_file" and events[2]["input"] == {"path": "a.py"}
+    assert events[3]["text"] == "tutto ok"
+    assert all(e["session_id"] == "router" and e["v"] == 1 for e in events)
+
+
+def test_fallito_e_conferma(monkeypatch):
+    srv, events = _fake_capri()
+    monkeypatch.setattr(capri, "PORT", srv.server_address[1])
+    capri.failed("boom")
+    capri.confirm("Modificare a.py?")
+    _flush()
+    srv.shutdown()
+    assert [(e["type"], e.get("error") or e.get("message")) for e in events] == [
+        ("failed", "boom"), ("needs.confirm", "Modificare a.py?")]
 
 
 def test_capri_spenta_non_rompe_nulla(monkeypatch):

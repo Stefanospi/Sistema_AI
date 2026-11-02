@@ -465,3 +465,122 @@ def test_server_router_coding_senza_gratuiti_usa_claude(make_brain):
     finally:
         server._router_instance = server._brain_instance = None
         server.response_cache.clear()
+
+
+# ---------- fase 2: sessioni lato server, riassunti, CLI ----------
+
+def contents(messages):
+    return [(m["role"], m["content"]) for m in messages]
+
+
+@pytest.fixture
+def served(make_brain):
+    import server
+    from fastapi.testclient import TestClient
+
+    def start(backend, **kw):
+        brain, router = make_brain(backend, **kw)
+        server._router_instance, server._brain_instance = router, brain
+        server.response_cache.clear()
+        return TestClient(server.app, raise_server_exceptions=False), brain, router
+
+    yield start
+    server._router_instance = server._brain_instance = None
+    server.response_cache.clear()
+
+
+def test_sessione_ricorda_gli_scambi(served):
+    backend = StubBackend(ok_events("prima risposta"))
+    client, brain, router = served(backend)
+    post = lambda text, **kw: client.post("/v1/chat/completions", json={
+        "model": "brain-basso", "session": "capri", "messages": [{"role": "user", "content": text}], **kw})
+    assert post("prima domanda").status_code == 200
+    backend.events = ok_events("seconda risposta")
+    assert post("seconda domanda").status_code == 200
+    sent = [m for m in backend.sent[1] if m["role"] != "system"]
+    assert contents(sent) == [("user", "prima domanda"), ("assistant", "prima risposta"), ("user", "seconda domanda")]
+    assert [r for _, r, _ in router.memory.active("capri")] == ["user", "assistant", "user", "assistant"]
+
+
+def test_sessione_in_streaming_e_reset(served):
+    backend = StubBackend(ok_events("risposta stream"))
+    client, brain, router = served(backend)
+    body = {"model": "brain-basso", "session": "capri", "stream": True,
+            "messages": [{"role": "user", "content": "ciao"}]}
+    s = client.post("/v1/chat/completions", json=body)
+    assert "risposta stream" in s.text
+    assert [(r, c) for _, r, c in router.memory.active("capri")] == [("user", "ciao"), ("assistant", "risposta stream")]
+    r = client.post("/v1/sessions/capri/reset")
+    assert r.status_code == 200 and r.json()["cleared"] == 2
+    assert router.memory.active("capri") == []
+
+
+def test_sessione_non_usa_la_cache(served):
+    backend = StubBackend(ok_events("x"))
+    client, _, _ = served(backend)
+    body = {"model": "brain-basso", "session": "s", "messages": [{"role": "user", "content": "ciao"}]}
+    client.post("/v1/chat/completions", json=body)
+    client.post("/v1/chat/completions", json=body)
+    assert len(backend.aliases) == 2
+
+
+def test_sessioni_separate(served):
+    backend = StubBackend(ok_events("ok"))
+    client, brain, router = served(backend)
+    for sid in ("a", "b"):
+        client.post("/v1/chat/completions", json={
+            "model": "brain-basso", "session": sid, "messages": [{"role": "user", "content": f"da {sid}"}]})
+    assert [c for _, _, c in router.memory.active("a")][0] == "da a"
+    assert [c for _, _, c in router.memory.active("b")][0] == "da b"
+
+
+def test_sessione_solo_con_i_modelli_claude(served):
+    client, _, router = served(StubBackend(ok_events()), cfg={"modelli_gratuiti": True})
+    r = client.post("/v1/chat/completions", json={
+        "model": "router-coding", "session": "s", "messages": [{"role": "user", "content": "x"}]})
+    assert r.status_code == 400 and "session" in r.json()["error"]["message"]
+    bad = client.post("/v1/chat/completions", json={
+        "model": "brain-basso", "session": "../etc", "messages": [{"role": "user", "content": "x"}]})
+    assert bad.status_code == 400
+
+
+def test_riassunto_con_claude_basso(make_brain):
+    backend = StubBackend(ok_events("RIASSUNTO"))
+    brain, router = make_brain(backend)
+    router.cfg["memoria"]["max_messaggi"] = 4
+    for i in range(4):
+        router.memory.add("s", "user", f"domanda {i}")
+        router.memory.add("s", "assistant", f"risposta {i}")
+    router._maybe_compact("s")
+    assert router.memory.summary("s") == "RIASSUNTO"
+    assert backend.aliases == ["haiku"]          # livello basso, mai i modelli gratuiti
+    assert len(router.memory.active("s")) < 8
+
+
+def test_memory_clear(make_router):
+    r = make_router({})
+    r.memory.add("s", "user", "a")
+    r.memory.compact("s", 1, "sommario")
+    assert r.memory.clear("s") == 1
+    assert r.memory.active("s") == [] and r.memory.summary("s") == ""
+
+
+def test_ask_della_cli_passa_dal_cervello(make_brain):
+    backend = StubBackend(ok_events("dal cervello"))
+    brain, router = make_brain(backend, script={M1: [msg("NON deve servire")]})
+    seen = []
+    category, model, answer = router.ask("default", "ciao", category="generale", on_text=seen.append)
+    assert answer == "dal cervello" and "".join(seen) == "dal cervello"
+    assert router.client.calls == [] and backend.aliases == ["haiku"]
+    assert [r for _, r, _ in router.memory.active("default")] == ["user", "assistant"]
+
+
+def test_ask_con_immagini_non_usa_i_gratuiti(make_brain, tmp_path):
+    backend = StubBackend(ok_events())
+    brain, router = make_brain(backend, script={M1: [msg("NON deve servire")]})
+    router.cfg["brain"] = {"modelli_gratuiti": False}
+    img = tmp_path / "a.png"
+    img.write_bytes(b"\x89PNG")
+    with pytest.raises(RuntimeError, match="Modelli gratuiti disattivati"):
+        router.ask("default", "che finestra e'?", category="desktop", images=[img])
+    assert router.client.calls == []

@@ -6,4 +6,7 @@ __pycache__/
 .pytest_cache/
 *.log
 
-.fakebrain_usage.db
+.fake
+brain_usage.db
+memoria.db-shm
+memoria.db-wal

@@ -461,3 +461,26 @@ Riepilogo rapido:
 - Il **tool calling** dei modelli gratuiti è spesso inaffidabile
 - I provider gratuiti **possono registrare i prompt** — non inviare dati riservati
 - Il server risponde solo su `127.0.0.1` — non esporlo su rete pubblica
+
+
+---
+
+## Cervello Claude (`brain-*`)
+
+Dalla fase 1 le richieste di solo testo passano da **Claude** (abbonamento, via la CLI `claude -p`), non dai modelli gratuiti.
+Tutto si regola nella sezione `brain:` di `config.yaml`.
+
+- **Modelli virtuali**: `brain-auto` (livello deciso dalla policy), `brain-basso` (Haiku), `brain-medio` (Sonnet), `brain-alto` (Opus).
+- **Niente modelli gratuiti**: con `brain.modelli_gratuiti: false` nessun prompt parte verso OpenRouter, nemmeno come ripiego;
+  `router-*` e gli ID OpenRouter vengono instradati a Claude. Le richieste con `tools` ricevono un errore chiaro.
+- **Consumi**: budget giornaliero e settimanale (prezzo di listino), soglie sulla quota reale del piano
+  (`quota_piano`, comprende anche Claude Code), storico limitato (`limiti`), risposta concisa (`stile`), `--effort` per livello.
+  `GET /stats` mostra spesa, residuo e ultime letture della quota.
+- **Sessioni**: `POST /v1/chat/completions` accetta `"session": "<id>"`; il client manda solo il nuovo messaggio, la cronologia sta
+  nella memoria SQLite del router (riassunta con Haiku oltre `memoria.max_messaggi`). `POST /v1/sessions/<id>/reset` la dimentica.
+  Le sessioni non usano la cache delle risposte.
+- **Capri**: il router le manda eventi "Agent Events v1" (`request.start`, `model.attempt`, `tool.call`, `needs.confirm`, `done`, `failed`),
+  vedi `capri_bridge.py`.
+- **CLI**: `python chat.py` usa lo stesso cervello per il testo. Immagini (`/img`) e agente (`--agente`) usano ancora i modelli gratuiti
+  e con `modelli_gratuiti: false` danno errore.
+- **Binario**: la CLI viene cercata in `brain.claude.binario`, `CLAUDE_BIN`, PATH, estensione VS Code.

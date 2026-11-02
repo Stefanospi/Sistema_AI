@@ -123,6 +123,14 @@ class Memory:
         ).fetchone()
         return row[0] if row else ""
 
+    def clear(self, session: str) -> int:
+        """Dimentica la sessione (messaggi e riassunti). Restituisce i messaggi rimossi."""
+        n = self.db.execute("SELECT COUNT(*) FROM messages WHERE session=?", (session,)).fetchone()[0]
+        self.db.execute("DELETE FROM messages WHERE session=?", (session,))
+        self.db.execute("DELETE FROM summaries WHERE session=?", (session,))
+        self.db.commit()
+        return n
+
     def compact(self, session: str, upto_id: int, new_summary: str):
         self.db.execute(
             "INSERT INTO summaries(session, content, ts) VALUES(?,?,?)",
@@ -143,6 +151,8 @@ class Router:
         setup_logging(self.cfg, log_file)
         self._no_tools: set[str] = set()  # modelli che hanno rifiutato i tool nativi (validi per questa esecuzione)
         self._cooldown: dict[str, float] = {}  # modello -> istante (monotonic) fino al quale viene saltato
+        self.brain = None       # Brain (brain.py): se presente gestisce le richieste di solo testo
+        self.summarizer = None  # prompt -> riassunto; il Brain lo imposta per non usare i modelli gratuiti
         # cache risposte: TTL 5 min, max 200 entrate
         self._response_cache = TTLCache(ttl_seconds=300, max_size=200)
         # client/memory/sleep iniettabili: servono ai test (nessuna rete, nessuna attesa reale)
@@ -368,7 +378,20 @@ class Router:
             return
         raise RuntimeError("Tutti i modelli hanno fallito:\n  " + "\n  ".join(errors))
 
+    def _brain_step(self, messages, on_text, on_model, category):
+        if on_text is None:
+            return self.brain.complete(messages, "brain-auto", category)
+        for ev in self.brain.stream(messages, "brain-auto", category):
+            if ev[0] == "text":
+                on_text(ev[1])
+            elif ev[0] == "start" and on_model:
+                on_model(ev[1])
+            elif ev[0] == "final":
+                return ev[1], ev[2]
+
     def _step(self, models, messages, tools=None, vision=False, on_text=None, on_model=None, category=None):
+        if self.brain and not tools and not vision and self.brain.handles("brain-auto", None):
+            return self._brain_step(messages, on_text, on_model, category)
         if on_text is None:
             return self._complete(models, messages, tools, vision, category=category)
         for ev in self._stream(models, messages, tools, vision, category=category):
@@ -471,6 +494,15 @@ class Router:
 
         return category, model, answer
 
+    def _summarize(self, prompt: str) -> str:
+        if self.summarizer:
+            return (self.summarizer(prompt) or "").strip()
+        _, text = self._call(
+            self.cfg["categories"].get("appunti", self.cfg["categories"]["generale"])["models"],
+            [{"role": "user", "content": prompt}],
+        )
+        return text
+
     # -- riassunto automatico dei messaggi vecchi --
     def _maybe_compact(self, session: str):
         rows = self.memory.active(session)
@@ -490,10 +522,7 @@ class Router:
             + f"Nuovi messaggi:\n{transcript}"
         )
         try:
-            _, new_summary = self._call(
-                self.cfg["categories"].get("appunti", self.cfg["categories"]["generale"])["models"],
-                [{"role": "user", "content": prompt}],
-            )
+            new_summary = self._summarize(prompt)
         except RuntimeError:
             return  # riprova alla prossima risposta
         if not new_summary:

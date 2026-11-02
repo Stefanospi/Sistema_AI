@@ -178,6 +178,12 @@ class Brain:
         self.backend = backend or ClaudeCliBackend(self.cfg["claude"])
         self.budget = budget or Budget(daily_usd=self.cfg["budget"]["giornaliero_usd"],
                                        weekly_usd=self.cfg["budget"]["settimanale_usd"])
+        # la CLI e le sessioni del server passano da qui; i riassunti usano il livello più economico
+        router.brain = self
+        router.summarizer = self._summarize
+
+    def _summarize(self, prompt: str) -> str:
+        return self.complete([{"role": "user", "content": prompt}], "brain-basso", "appunti")[1].content or ""
 
     # -- quali richieste gestisce --
     def handles(self, model: str, tools) -> bool:
