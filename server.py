@@ -570,8 +570,13 @@ async def chat_completions(request: Request):
 
     router = get_router()
     session = validated.session
-    if session and not get_brain().handles(model, tools):
-        return openai_error(400, "session è supportato solo con i modelli Claude (brain-*), senza strumenti.",
+    brain = get_brain()
+    if session and not tools and brain.cfg["abilitato"] and not model.startswith("brain-"):
+        # una sessione la gestisce sempre il cervello, qualunque modello mandi il client (anche il vecchio
+        # "router-auto" salvato nelle impostazioni di Capri): è lui a scegliere tra gratuiti e Claude
+        model = "brain-auto"
+    if session and not brain.handles(model, tools):
+        return openai_error(400, "session non è supportato con gli strumenti (tools) o con il cervello disattivato.",
                             "invalid_request_error")
 
     if stream:

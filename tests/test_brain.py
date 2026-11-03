@@ -534,10 +534,36 @@ def test_sessioni_separate(served):
     assert [c for _, _, c in router.memory.active("b")][0] == "da b"
 
 
-def test_sessione_solo_con_i_modelli_claude(served):
-    client, _, router = served(StubBackend(ok_events()), cfg={"modelli_gratuiti": True})
+def test_sessione_con_un_modello_router_va_comunque_al_cervello(served):
+    """Il vecchio askModel "router-auto" salvato da Capri non deve rompere le sessioni."""
+    backend = StubBackend(ok_events("dal cervello"))
+    client, _, router = served(backend, cfg={"modelli_gratuiti": True})
+    for model in ("router-auto", "router-coding", "nvidia/nemotron-3.5-super-vl:free"):
+        r = client.post("/v1/chat/completions", json={
+            "model": model, "session": "s", "messages": [{"role": "user", "content": "x"}]})
+        assert r.status_code == 200, model
+        assert r.json()["choices"][0]["message"]["content"] == "dal cervello"
+    assert len(router.memory.active("s")) == 6
+
+
+def test_sessione_con_i_gratuiti_per_le_richieste_semplici(served):
+    from conftest import msg
+    light = "nvidia/nemotron-3.5-lightning:free"
+    backend = StubBackend(ok_events("NO"))
+    client, _, router = served(backend, script={light: [msg("dal gratuito")]},
+                               cfg={"modelli_gratuiti": True, "instradamento": {"gratuito": ["appunti"], "soglia_caratteri": 500}})
     r = client.post("/v1/chat/completions", json={
-        "model": "router-coding", "session": "s", "messages": [{"role": "user", "content": "x"}]})
+        "model": "router-auto", "session": "s",
+        "messages": [{"role": "user", "content": "segna un promemoria per domani"}]})
+    assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "dal gratuito"
+    assert backend.aliases == []
+
+
+def test_sessione_con_strumenti_resta_un_errore(served):
+    client, _, router = served(StubBackend(ok_events()), cfg={"modelli_gratuiti": True})
+    tools = [{"type": "function", "function": {"name": "x", "description": "x", "parameters": {}}}]
+    r = client.post("/v1/chat/completions", json={
+        "model": "router-coding", "session": "s", "tools": tools, "messages": [{"role": "user", "content": "x"}]})
     assert r.status_code == 400 and "session" in r.json()["error"]["message"]
     bad = client.post("/v1/chat/completions", json={
         "model": "brain-basso", "session": "../etc", "messages": [{"role": "user", "content": "x"}]})
