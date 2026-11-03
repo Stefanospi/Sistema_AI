@@ -136,6 +136,15 @@ brain:               # cervello Claude (abbonamento Pro, via CLI `claude -p`)
     alto: high
   livello_default: basso     # usato da brain-auto
   per_categoria: {}          # es. { coding: medio } per alzare il livello di una categoria
+  complessita:               # più la richiesta è difficile, più capace (e costoso) il modello. Un punto per segnale:
+    medio: 2                 #   lunghezza (>400 = 1, >1200 = 2), codice (1), parole da ragionamento (1 l'una, max 2)
+    alto: 4
+    parole: [analizza, confronta, progetta, architettura, ottimizza, strategia, ragiona, pro e contro, passo passo, in dettaglio, debug, refactor, dimostra, algoritmo]
+  livello_max_auto: medio    # Opus da solo non scatta mai: serve brain-alto o una frase di "salita"
+  risparmio_sopra: 0.3       # con la quota del piano (5 ore) già oltre il 30% si resta sul livello basso; 0 = mai
+  identita:                  # il carattere di Capri in ogni risposta
+    abilitata: true
+    testo: ""                # vuoto = quello di persona.py; scrivi qui il tuo per cambiarlo
   salita: ["pensaci bene", "approfondisci", "più accurato", "ragiona a fondo"]   # frasi che alzano di un livello
   schermo:                   # domande sullo schermo (/schermo in Capri): sempre Claude, mai i gratuiti
     livello: basso           # basso/medio/alto: per i controlli elencati basta il basso; sale se i puntamenti sono imprecisi

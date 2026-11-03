@@ -21,8 +21,10 @@ SYSTEM = (
     '"punto": [x, y] oppure null}.\n'
     '"elemento" quando uno dei controlli elencati è quello giusto (non inventare id). "punto" solo se nell\'elenco '
     "non c'è e hai lo screenshot: pixel dello screenshot, origine in alto a sinistra, centro dell'elemento. "
-    "Se non sai dove sia, usa null e dillo nella risposta."
+    "Se non sai dove sia, usa null e dillo nella risposta. Se la domanda riguarda quali programmi o finestre sono "
+    "aperti, rispondi con l'elenco delle finestre e usa null per \"elemento\" e \"punto\"."
 )
+MAX_WINDOWS = 60
 
 
 def _clean(value, limit: int = MAX_NAME) -> str:
@@ -45,17 +47,34 @@ def normalize_elements(elements: list[dict]) -> list[dict]:
     return out
 
 
+def normalize_windows(windows: list[dict]) -> list[dict]:
+    out = []
+    for w in windows or []:
+        if len(out) >= MAX_WINDOWS:
+            break
+        if not isinstance(w, dict) or not (w.get("process") or w.get("title")):
+            continue
+        out.append({"p": _clean(w.get("process"), 40), "t": _clean(w.get("title"), 100), "fg": bool(w.get("fg"))})
+    return out
+
+
 def build_messages(question: str, window: dict, elements: list[dict], image: str | None = None,
-                   image_size: list[int] | None = None) -> list[dict]:
+                   image_size: list[int] | None = None, windows: list[dict] | None = None) -> list[dict]:
     els = normalize_elements(elements)
-    lines = [f"Finestra: {_clean(window.get('process'), 40)} — {_clean(window.get('title'), 120)}"]
-    if els:
-        lines.append("Controlli (id|tipo|nome):")
-        for e in els:
-            label = e["n"] or (f"[{e['a']}]" if e["a"] else "")
-            lines.append(f"{e['i']}|{e['t']}|{label}" + ("" if e["e"] else "|disattivato"))
-    else:
-        lines.append("Nessun controllo leggibile: affidati allo screenshot.")
+    wins = normalize_windows(windows)
+    lines = []
+    if wins:
+        lines.append("Finestre aperte (programma — titolo):")
+        lines += [f"{w['p']} — {w['t']}" + (" (in primo piano)" if w["fg"] else "") for w in wins]
+    if window and (window.get("process") or window.get("title")):
+        lines.append(f"Finestra attiva: {_clean(window.get('process'), 40)} — {_clean(window.get('title'), 120)}")
+        if els:
+            lines.append("Controlli (id|tipo|nome):")
+            for e in els:
+                label = e["n"] or (f"[{e['a']}]" if e["a"] else "")
+                lines.append(f"{e['i']}|{e['t']}|{label}" + ("" if e["e"] else "|disattivato"))
+        else:
+            lines.append("Nessun controllo leggibile: affidati allo screenshot.")
     if image and image_size and len(image_size) == 2:
         lines.append(f"Lo screenshot è di {int(image_size[0])}x{int(image_size[1])} pixel.")
     lines.append(f"Domanda: {question.strip()}")

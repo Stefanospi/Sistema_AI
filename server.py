@@ -506,6 +506,7 @@ class ScreenRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     window: dict = Field(default_factory=dict)
     elements: list[dict] = Field(default_factory=list, max_length=screen_mod.MAX_ELEMENTS)
+    windows: list[dict] = Field(default_factory=list, max_length=screen_mod.MAX_WINDOWS)   # finestre aperte: programma, titolo
     image: str | None = Field(default=None, max_length=8_000_000)   # data URL della sola finestra attiva
     image_size: list[int] | None = Field(default=None, max_length=2)
 
@@ -519,7 +520,7 @@ def screen_ask(req: ScreenRequest):
     brain = get_brain()
     if not brain.cfg["abilitato"]:
         return openai_error(400, "Il cervello Claude è disattivato (brain.abilitato).", "invalid_request_error")
-    messages = screen_mod.build_messages(req.question, req.window, req.elements, req.image, req.image_size)
+    messages = screen_mod.build_messages(req.question, req.window, req.elements, req.image, req.image_size, req.windows)
     level = (brain.cfg.get("schermo") or {}).get("livello", "basso")
     capri.prompt(req.question, "schermo")
     try:

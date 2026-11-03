@@ -683,3 +683,113 @@ def test_schermo_e_livello_scelto_non_ripiegano_mai(make_brain):
     with pytest.raises(BackendError, match="budget"):       # l'immagine va a Claude e non ripiega mai sui gratuiti
         brain.complete(shot, "brain-auto", "appunti")
     assert router.client.calls == []
+
+
+# ---------- identità di Capri ----------
+
+def system_of(brain, text="ciao", extra_system=None):
+    msgs = ([{"role": "system", "content": extra_system}] if extra_system else []) + [{"role": "user", "content": text}]
+    return brain.prepare(msgs)[0]["content"]
+
+
+def test_identita_di_capri_in_ogni_prompt(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()))
+    s = system_of(brain)
+    assert s.startswith("Sei Capri")
+    assert "Progetto Capricorn" in s and "choom" in s and "menti" in s
+    assert "non dici mai" in s and "come modello linguistico" in s       # mai "come modello linguistico"
+    assert "ti viene mostrato" in s                                      # onestà: vede solo ciò che le viene mostrato
+    assert "conciso" in s                                                # la concisione resta in fondo
+
+
+def test_identita_prima_del_compito_e_stile_in_fondo(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()))
+    s = system_of(brain, extra_system="Rispondi SOLO con JSON.")
+    assert s.index("Sei Capri") < s.index("Rispondi SOLO con JSON.") < s.index("conciso")
+
+
+def test_identita_sostituibile_e_disattivabile(make_brain):
+    custom, _ = make_brain(StubBackend(ok_events()), cfg={"identita": {"abilitata": True, "testo": "Sei Pippo."}})
+    s = system_of(custom)
+    assert s.startswith("Sei Pippo.") and "Sei Capri" not in s
+    off, _ = make_brain(StubBackend(ok_events()), cfg={"identita": {"abilitata": False}})
+    assert "Sei Capri" not in system_of(off)
+
+
+def test_identita_anche_sul_percorso_gratuito(make_brain):
+    from conftest import msg
+    light = "nvidia/nemotron-3.5-lightning:free"
+    brain, router = make_brain(StubBackend(ok_events("NO")), script={light: [msg("ok")]}, cfg=dict(MIXED))
+    brain.complete(ask("segna di chiamare Mario"), "brain-auto", "appunti")
+    sent = router.client.calls[0]["messages"][0]
+    assert sent["role"] == "system" and sent["content"].startswith("Sei Capri")
+
+
+def test_identita_non_inventa_la_serie():
+    import persona
+    for claimed in ("stagione", "episodio", "David", "Lucy", "Rebecca", "Arasaka", "Militech"):
+        assert claimed not in persona.PERSONA, claimed
+
+
+# ---------- difficoltà -> modello ----------
+
+def lvl(brain, text, category="generale", model="brain-auto"):
+    return brain.level(model, category, [{"role": "user", "content": text}])
+
+
+def test_domande_facili_restano_sul_basso(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()))
+    assert lvl(brain, "ciao, che ore sono?") == "basso"
+    assert lvl(brain, "come si chiama la capitale della Francia?") == "basso"
+
+
+def test_la_difficolta_sale_fino_al_medio_e_li_si_ferma(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()))
+    assert brain.complexity([{"role": "user", "content": "analizza e confronta passo passo queste due architetture"}]) == 2
+    assert lvl(brain, "analizza e confronta passo passo queste due architetture") == "medio"
+    hard = "analizza confronta progetta ```x``` " + "testo lungo " * 200
+    assert brain.complexity([{"role": "user", "content": hard}]) >= 4
+    assert lvl(brain, hard) == "medio"                    # Opus da solo non scatta mai
+
+
+def test_lunghezza_e_codice_contano(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()))
+    assert lvl(brain, "x " * 250) == "basso"              # 500 caratteri: un punto soltanto
+    assert lvl(brain, "x " * 250 + "```a```") == "medio"  # lungo + codice
+
+
+def test_alto_solo_se_lo_chiedi(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"salita": ["pensaci bene"]})
+    hard = "analizza e confronta passo passo queste due architetture"
+    assert lvl(brain, hard + ", pensaci bene") == "alto"
+    assert lvl(brain, "ciao", model="brain-alto") == "alto"
+    assert lvl(brain, "ciao", model="brain-basso") == "basso"
+    unlocked, _ = make_brain(StubBackend(ok_events()), cfg={"livello_max_auto": "alto"})
+    assert lvl(unlocked, "analizza confronta progetta " + "x " * 700) == "alto"
+
+
+def test_categoria_alza_il_punto_di_partenza_ma_non_il_tetto(make_brain):
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"per_categoria": {"coding": "alto"}})
+    assert lvl(brain, "ciao", category="coding") == "alto"
+
+
+def test_con_la_quota_alta_si_risparmia(make_brain):
+    import time
+    brain, _ = make_brain(StubBackend(ok_events()), cfg={"salita": ["pensaci bene"]})
+    hard = "analizza e confronta passo passo queste due architetture"
+    assert lvl(brain, hard) == "medio"
+    brain.budget.record_plan({"five_hour": {"utilization": 0.35, "resets_at": time.time() + 3600}})
+    assert lvl(brain, hard) == "basso"                    # sopra il 30%: solo il livello economico
+    assert lvl(brain, hard + " pensaci bene") == "alto"   # ma se lo chiedi esplicitamente, sì
+    assert lvl(brain, "ciao", model="brain-medio") == "medio"
+    brain.cfg["risparmio_sopra"] = 0
+    assert lvl(brain, hard) == "medio"
+
+
+def test_il_modello_arriva_al_backend_in_base_alla_difficolta(make_brain):
+    backend = StubBackend(ok_events())
+    brain, _ = make_brain(backend)
+    brain.complete(ask("ciao"), "brain-auto", "generale")
+    brain.complete(ask("analizza e confronta passo passo queste due architetture"), "brain-auto", "generale")
+    assert backend.aliases == ["haiku", "sonnet"]
+    assert backend.efforts == ["low", "medium"]

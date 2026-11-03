@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import capri_bridge as capri
 from backends import BackendError, ClaudeCliBackend
+from persona import PERSONA
 
 BASE_DIR = Path(__file__).parent
 log = logging.getLogger("airouter.brain")
@@ -39,6 +40,13 @@ DEFAULTS = {
     "livello_default": "basso",
     "per_categoria": {},
     "salita": [],
+    # difficoltà -> livello (modello): ogni segnale vale un punto, vedi Brain.complexity
+    "complessita": {"medio": 2, "alto": 4, "parole": [
+        "analizza", "confronta", "progetta", "architettura", "ottimizza", "strategia", "ragiona", "pro e contro",
+        "passo passo", "in dettaglio", "debug", "refactor", "dimostra", "algoritmo"]},
+    "livello_max_auto": "medio",     # il livello alto (Opus) da solo non scatta mai: serve brain-alto o una frase di "salita"
+    "risparmio_sopra": 0.3,          # quota del piano (finestra da 5 ore) oltre cui si resta sul livello basso; 0 = mai
+    "identita": {"abilitata": True, "testo": ""},   # il carattere di Capri; testo vuoto = persona.py
     "limiti": {"max_messaggi_storico": 6, "max_caratteri_prompt": 16000},
     "schermo": {"livello": "basso"},   # livello di Claude per le domande sullo schermo (/v1/screen/ask)
     "stile": ("Rispondi in italiano, in modo diretto e conciso: niente premesse né riassunto finale. "
@@ -236,17 +244,40 @@ class Brain:
         return "gratuito", "semplice"
 
     # -- policy: livello e modello --
+    def complexity(self, messages: list[dict]) -> int:
+        """Quanto è difficile l'ultima richiesta: lunghezza, codice, parole da ragionamento (un punto l'una, al massimo due)."""
+        text = _last_user_text(messages)
+        low = text.lower()
+        score = 2 if len(text) > 1200 else 1 if len(text) > 400 else 0
+        score += 1 if "```" in text else 0
+        return score + min(2, sum(1 for w in self.cfg["complessita"]["parole"] if w in low))
+
     def level(self, model: str, category: str | None, messages: list[dict]) -> str:
+        """Livello (= modello) per la richiesta. Scelto a mano (brain-medio...) vince su tutto. Altrimenti parte dalla
+        categoria, sale con la difficoltà fino a livello_max_auto, sale ancora se lo chiedi a parole ("pensaci bene"),
+        e con la quota del piano già alta resta sul basso."""
         forced = model[len(PREFIX):] if model.startswith(PREFIX) else ""
         if forced in LEVELS:
             return forced
-        level = self.cfg["per_categoria"].get(category) or self.cfg["livello_default"]
-        if level not in LEVELS:
-            level = "basso"
-        text = _last_user_text(messages).lower()
-        if any(k.lower() in text for k in self.cfg["salita"]):
-            level = LEVELS[min(LEVELS.index(level) + 1, len(LEVELS) - 1)]
-        return level
+        base = self.cfg["per_categoria"].get(category) or self.cfg["livello_default"]
+        idx = LEVELS.index(base) if base in LEVELS else 0
+        c = self.cfg["complessita"]
+        score = self.complexity(messages)
+        if score >= int(c["alto"]):
+            idx = max(idx, LEVELS.index("alto"))
+        elif score >= int(c["medio"]):
+            idx = max(idx, LEVELS.index("medio"))
+        cap = LEVELS.index(self.cfg["livello_max_auto"]) if self.cfg["livello_max_auto"] in LEVELS else 1
+        idx = min(idx, max(cap, LEVELS.index(base) if base in LEVELS else 0))
+        asked = any(k.lower() in _last_user_text(messages).lower() for k in self.cfg["salita"])
+        if asked:
+            idx = min(idx + 1, len(LEVELS) - 1)
+        saving = float(self.cfg["risparmio_sopra"] or 0)
+        if saving and not asked:
+            used = (self.budget.plan_state().get("five_hour") or {}).get("utilization", 0)
+            if used >= saving:
+                idx = 0
+        return LEVELS[idx]
 
     # -- meno token --
     def prepare(self, messages: list[dict]) -> list[dict]:
@@ -264,7 +295,10 @@ class Brain:
             turns.pop(0)  # un taglio non deve lasciare una risposta orfana in testa
         style = str(self.cfg["stile"]).strip()
         base = "\n\n".join(str(m.get("content") or "").strip() for m in system if m.get("content"))
-        return [{"role": "system", "content": (base + "\n\n" + style).strip()}] + turns
+        ident = self.cfg["identita"]
+        persona = (str(ident.get("testo") or "").strip() or PERSONA) if ident.get("abilitata") else ""
+        # prima il carattere, poi le istruzioni del compito (formato di risposta incluso), in fondo la concisione
+        return [{"role": "system", "content": "\n\n".join(p for p in (persona, base, style) if p)}] + turns
 
     def status(self) -> dict:
         return {**self.budget.status(), "livelli": self.cfg["livelli"], "livello_default": self.cfg["livello_default"],

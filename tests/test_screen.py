@@ -182,3 +182,46 @@ def test_endpoint_validazione_e_browser(served):
     client, _, _ = served(StubBackend(ok_events()))
     assert client.post("/v1/screen/ask", json={"question": ""}).status_code == 422
     assert client.post("/v1/screen/ask", headers={"Origin": "https://evil.example"}, json=request_body()).status_code == 403
+
+
+# ---------- elenco delle finestre aperte ----------
+
+WINDOWS = [
+    {"process": "chrome", "title": "Posta in arrivo | mario@example.com", "fg": False},
+    {"process": "Code", "title": "brain.py - Sistema_AI - Visual Studio Code", "fg": True},
+    {"process": "", "title": ""},
+    "non un dizionario",
+]
+
+
+def test_build_messages_con_le_finestre_aperte():
+    msgs = screen.build_messages("Quali app ho aperte?", {}, [], None, None, WINDOWS)
+    text = msgs[1]["content"][0]["text"]
+    assert "Finestre aperte (programma — titolo):" in text
+    assert "chrome — Posta in arrivo mario@example.com" in text      # | tolto dai titoli
+    assert "Code — brain.py - Sistema_AI - Visual Studio Code (in primo piano)" in text
+    assert "Finestra attiva" not in text and "Controlli" not in text and "screenshot" not in text.lower().replace("nessun controllo", "")
+    assert text.rstrip().endswith("Domanda: Quali app ho aperte?")
+    assert "elenco delle finestre" in msgs[0]["content"]                                   # il prompt sa come rispondere
+
+
+def test_finestre_e_finestra_attiva_insieme():
+    msgs = screen.build_messages("Aiutami con questo", WINDOW, ELEMENTS, None, None, WINDOWS)
+    text = msgs[1]["content"][0]["text"]
+    assert text.index("Finestre aperte") < text.index("Finestra attiva") < text.index("Controlli")
+
+
+def test_finestre_limite():
+    many = [{"process": "p", "title": f"t{i}"} for i in range(200)]
+    assert len(screen.normalize_windows(many)) == screen.MAX_WINDOWS
+
+
+def test_endpoint_con_le_finestre_aperte(served):
+    backend = StubBackend(ok_events('{"risposta": "Hai Chrome e VS Code aperti, choom.", "elemento": null, "punto": null}'))
+    client, brain, router = served(backend)
+    r = client.post("/v1/screen/ask", json={"question": "Quali app ho aperte?", "windows": WINDOWS[:2]})
+    assert r.status_code == 200 and r.json()["target"] is None
+    assert r.json()["text"].startswith("Hai Chrome")
+    sent = backend.sent[0]
+    assert sent[0]["content"].startswith("Sei Capri")                    # l'identità arriva anche qui
+    assert "Code — brain.py" in sent[-1]["content"][0]["text"]
