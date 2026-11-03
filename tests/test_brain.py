@@ -654,6 +654,6 @@ def test_schermo_e_livello_scelto_non_ripiegano_mai(make_brain):
         brain.complete(ask("ciao"), "brain-alto", "appunti")
     shot = [{"role": "user", "content": [{"type": "text", "text": "cosa vedi?"},
                                          {"type": "image_url", "image_url": {"url": "data:..."}}]}]
-    with pytest.raises(BackendError, match="fase 4"):
+    with pytest.raises(BackendError, match="budget"):       # l'immagine va a Claude e non ripiega mai sui gratuiti
         brain.complete(shot, "brain-auto", "appunti")
     assert router.client.calls == []

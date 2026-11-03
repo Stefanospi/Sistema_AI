@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 import capri_bridge as capri
 import convert as converter
+import screen as screen_mod
 from cache import response_cache, model_list_cache
 
 BASE_DIR = Path(__file__).parent
@@ -499,6 +500,35 @@ def convert_file(req: ConvertRequest):
 def convert_formats():
     """Formato di partenza -> formati di arrivo."""
     return converter.supported()
+
+
+class ScreenRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    window: dict = Field(default_factory=dict)
+    elements: list[dict] = Field(default_factory=list, max_length=screen_mod.MAX_ELEMENTS)
+    image: str | None = Field(default=None, max_length=8_000_000)   # data URL della sola finestra attiva
+    image_size: list[int] | None = Field(default=None, max_length=2)
+
+
+@app.post("/v1/screen/ask", dependencies=[Depends(check_token)])
+def screen_ask(req: ScreenRequest):
+    """Domanda sulla finestra attiva: controlli (UI Automation) ed eventuale screenshot, sempre a Claude.
+    Risponde {text, target}: il bersaglio è un controllo dell'elenco o un punto dello screenshot.
+    A Capri arrivano request.start e il tentativo; la risposta la chiude il client, che deve prima
+    aggiungere il puntamento, quindi qui non parte l'evento "done"."""
+    brain = get_brain()
+    if not brain.cfg["abilitato"]:
+        return openai_error(400, "Il cervello Claude è disattivato (brain.abilitato).", "invalid_request_error")
+    messages = screen_mod.build_messages(req.question, req.window, req.elements, req.image, req.image_size)
+    level = (brain.cfg.get("schermo") or {}).get("livello", "basso")
+    capri.prompt(req.question, "schermo")
+    try:
+        used, msg = brain.complete(messages, f"brain-{level}", "desktop")
+    except RuntimeError as e:  # BackendError compreso: budget, quota, CLI, immagine non valida
+        capri.failed(str(e))
+        return openai_error(502, str(e))
+    answer = screen_mod.parse_answer(msg.content or "", req.elements, req.image_size)
+    return {**answer, "model": used}
 
 
 @app.post("/cache/clear", dependencies=[Depends(check_token)])

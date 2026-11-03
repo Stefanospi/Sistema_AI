@@ -500,3 +500,14 @@ Librerie Python, nessun modello e nessun token. Installazione: `pip install -r r
   semplificata); pdf verso txt (non fa OCR); csv, xlsx, json, yaml tra loro dove ha senso.
 - **Sicurezza**: non sovrascrive mai (se esiste diventa `nome (1).pdf`); lavora solo in `conversione.cartelle_consentite` (di default la
   tua cartella utente); rifiuta file con nome da segreto (`.env`, chiavi); limite `dimensione_max_mb`.
+
+## Domande sullo schermo (`POST /v1/screen/ask`)
+
+Usato da `/schermo` in Capri. Riceve la domanda, la finestra attiva come elenco di controlli (`id|tipo|nome`, da UI Automation) ed
+eventualmente uno screenshot di quella sola finestra (data URL, max ~4 MB). Risponde `{text, target}`: il bersaglio è un controllo
+dell'elenco (`source: "uia"`, con il suo rettangolo) o un punto dello screenshot (`source: "image"`). Va **sempre a Claude** (mai ai
+gratuiti), al livello `brain.schermo.livello`, e conta nel budget e nella quota del piano. Le coordinate dei controlli non vengono
+mandate al modello (meno token); lo screenshot sì, solo se serve. A Capri arrivano `request.start` e il tentativo; la risposta la
+chiude Capri stessa, perché deve prima aggiungere il puntamento.
+
+Per le immagini la CLI usa l'input `stream-json` senza strumenti. Si accettano solo data URL base64 (png, jpeg, webp, gif), massimo 3.

@@ -40,6 +40,7 @@ DEFAULTS = {
     "per_categoria": {},
     "salita": [],
     "limiti": {"max_messaggi_storico": 6, "max_caratteri_prompt": 16000},
+    "schermo": {"livello": "basso"},   # livello di Claude per le domande sullo schermo (/v1/screen/ask)
     "stile": ("Rispondi in italiano, in modo diretto e conciso: niente premesse né riassunto finale. "
               "Entra nei dettagli solo se richiesto."),
     "budget": {"giornaliero_usd": 0.5, "settimanale_usd": 2.0},
@@ -303,8 +304,6 @@ class Brain:
         emitted, failure = False, None
         t0 = time.monotonic()
         try:
-            if _has_image(messages):
-                raise BackendError("Le immagini (schermo) arrivano con la fase 4: per ora Claude lavora solo sul testo.")
             self.budget.check()
             self.budget.check_plan(self.cfg["quota_piano"])
             prepared = self.prepare(messages)

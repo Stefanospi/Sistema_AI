@@ -137,6 +137,8 @@ brain:               # cervello Claude (abbonamento Pro, via CLI `claude -p`)
   livello_default: basso     # usato da brain-auto
   per_categoria: {}          # es. { coding: medio } per alzare il livello di una categoria
   salita: ["pensaci bene", "approfondisci", "più accurato", "ragiona a fondo"]   # frasi che alzano di un livello
+  schermo:                   # domande sullo schermo (/schermo in Capri): sempre Claude, mai i gratuiti
+    livello: basso           # basso/medio/alto: per i controlli elencati basta il basso; sale se i puntamenti sono imprecisi
   limiti:                    # meno token in ingresso
     max_messaggi_storico: 6          # ultimi messaggi inviati (3 scambi)
     max_caratteri_prompt: 16000      # oltre, si scartano i messaggi più vecchi / si taglia il centro dell'ultimo

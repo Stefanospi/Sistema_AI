@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -70,6 +71,41 @@ def build_prompt(messages: list[dict]) -> tuple[str, str]:
                     f"Ultimo messaggio dell'utente, a cui rispondere:\n{_text_of(turns[-1].get('content'))}")
 
 
+MAX_IMAGES = 3
+MAX_IMAGE_B64 = 6_000_000
+DATA_URL = re.compile(r"^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$")
+
+
+def last_user_images(messages: list[dict]) -> list[dict]:
+    """Blocchi immagine dell'ultimo messaggio utente (data URL base64). Le immagini dei messaggi
+    precedenti non si rimandano: costano token a ogni giro."""
+    last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    blocks = []
+    for part in (last.get("content") if last and isinstance(last.get("content"), list) else []):
+        if not isinstance(part, dict) or part.get("type") == "text":
+            continue
+        url = (part.get("image_url") or {}).get("url", "") if part.get("type") == "image_url" else ""
+        m = DATA_URL.match(url.strip())
+        if not m or len(m.group(2)) > MAX_IMAGE_B64:
+            raise BackendError("Immagine non valida: servono data URL base64 (png, jpeg, webp, gif) sotto i ~4 MB.")
+        blocks.append({"type": "image", "source": {"type": "base64", "media_type": m.group(1),
+                                                    "data": re.sub(r"\s+", "", m.group(2))}})
+    if len(blocks) > MAX_IMAGES:
+        raise BackendError(f"Troppe immagini (massimo {MAX_IMAGES}).")
+    return blocks
+
+
+def _without_images(messages: list[dict]) -> list[dict]:
+    """Come messages, ma l'ultimo messaggio utente senza le immagini (viaggiano come blocchi a parte)."""
+    out = [dict(m) for m in messages]
+    for m in reversed(out):
+        if m.get("role") == "user":
+            if isinstance(m.get("content"), list):
+                m["content"] = [p for p in m["content"] if isinstance(p, dict) and p.get("type") == "text"]
+            break
+    return out
+
+
 class ClaudeCliBackend:
     def __init__(self, cfg: dict | None = None, popen=subprocess.Popen):
         cfg = cfg or {}
@@ -82,10 +118,12 @@ class ClaudeCliBackend:
         # cartella neutra: la CLI non deve leggere CLAUDE.md né file di un progetto qualsiasi
         self.cwd = str(Path(tempfile.gettempdir()))
 
-    def _argv(self, alias: str, system: str, effort: str | None) -> list[str]:
+    def _argv(self, alias: str, system: str, effort: str | None, with_images: bool = False) -> list[str]:
         argv = [find_claude_bin(self.binary), "-p", "--model", alias,
                 "--output-format", "stream-json", "--include-partial-messages", "--verbose",
                 "--no-session-persistence", "--tools", "", "--safe-mode"]
+        if with_images:
+            argv += ["--input-format", "stream-json"]  # l'unico modo di passare immagini senza strumenti
         if effort:
             argv += ["--effort", effort]
         if self.max_budget:
@@ -95,15 +133,21 @@ class ClaudeCliBackend:
         return argv
 
     def stream(self, messages: list[dict], alias: str, effort: str | None = None):
-        system, prompt = build_prompt(messages)
+        images = last_user_images(messages)
+        system, prompt = build_prompt(_without_images(messages) if images else messages)
         if not prompt.strip():
             raise BackendError("Nessun messaggio utente da inviare.")
+        if images:
+            payload = json.dumps({"type": "user", "message": {"role": "user",
+                                  "content": images + [{"type": "text", "text": prompt}]}}) + "\n"
+        else:
+            payload = prompt
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
         if self.max_output:
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(self.max_output)
         label = f"claude/{alias}"
         try:
-            proc = self._popen(self._argv(alias, system, effort), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            proc = self._popen(self._argv(alias, system, effort, bool(images)), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                cwd=self.cwd, env=env)
         except OSError as e:
@@ -119,7 +163,7 @@ class ClaudeCliBackend:
         emitted, result, tail, plan = False, None, [], {}
         try:
             try:
-                proc.stdin.write(prompt)
+                proc.stdin.write(payload)
                 proc.stdin.close()
             except OSError:
                 pass  # il processo è già morto: l'errore esce dalla lettura dell'output
