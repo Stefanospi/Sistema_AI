@@ -7,7 +7,7 @@ Due modalità selezionabili tramite il campo "model" nella richiesta:
   - AGENTE: espone le categorie come modelli virtuali (router-coding, router-auto…);
     gli strumenti di tools.py NON vengono esportati via HTTP (solo via CLI).
 
-Sicurezza: ascolta solo su 127.0.0.1; token Bearer opzionale (ROUTER_API_TOKEN in .env);
+Sicurezza: ascolta solo su 127.0.0.1 (il telefono passa da un tunnel privato, vedi mobile.py); token Bearer opzionale (ROUTER_API_TOKEN in .env);
 nessuna chiave nei log; nessuna risposta di errore che riveli la chiave reale.
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 import capri_bridge as capri
 import convert as converter
+import mobile
 import screen as screen_mod
 from cache import response_cache, model_list_cache
 
@@ -409,6 +410,46 @@ app = FastAPI(
     docs_url=None,   # disabilita Swagger UI in produzione locale
     redoc_url=None,
 )
+
+
+# ---------- telefono (mobile.py) ----------
+
+@app.middleware("http")
+async def only_mobile_from_outside(request: Request, call_next):
+    """Una richiesta che arriva da un proxy (il tunnel del telefono) vede solo /m: il resto è del PC."""
+    if mobile.from_proxy(request) and not (request.url.path == "/m" or request.url.path.startswith("/m/")):
+        return JSONResponse(status_code=403, content={"error": "Non disponibile da remoto."})
+    return await call_next(request)
+
+
+def _mobile_enabled() -> bool:
+    return bool((get_router().cfg.get("mobile") or {}).get("abilitato", False))
+
+
+def _mobile_ask(text: str) -> str:
+    """Una domanda dal telefono: stessa strada delle sessioni (cervello, memoria, Capri sul PC)."""
+    router = get_router()
+    brain = get_brain()
+    if not brain.cfg["abilitato"]:
+        raise RuntimeError("Il cervello Claude è disattivato (brain.abilitato).")
+    messages = _session_messages(router, mobile.SESSION, [{"role": "user", "content": text}])
+    capri.prompt(text, "telefono")
+    try:
+        _, msg = brain.complete(messages, "brain-auto", "telefono")
+    except RuntimeError as e:
+        capri.failed(str(e))
+        raise
+    answer = (msg.content or "").strip()
+    capri.done(answer)
+    _remember(router, mobile.SESSION, text, answer, "telefono")
+    return answer
+
+
+app.include_router(mobile.make_router(
+    ask=_mobile_ask,
+    reset=lambda: get_router().memory.clear(mobile.SESSION),
+    enabled=_mobile_enabled,
+))
 
 
 @app.get("/v1/models", dependencies=[Depends(check_token)])

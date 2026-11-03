@@ -386,6 +386,27 @@ VS Code aprirà il file `chatLanguageModels.json` (nella cartella dati utente). 
 
 ---
 
+## Capri sul telefono
+
+Una pagina di chat (installabile come app) per usare lo stesso cervello da fuori casa. Il server resta su
+`127.0.0.1`: il telefono lo raggiunge da un tunnel privato, mai da una porta aperta su Internet.
+
+1. **Token**: in `.env` aggiungi `MOBILE_TOKEN=` con almeno 24 caratteri casuali e diverso da `ROUTER_API_TOKEN`
+   (per generarlo: `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
+2. **Accendi**: in `config.yaml` imposta `mobile.abilitato: true` e riavvia `server.py`.
+3. **Tunnel**: installa [Tailscale](https://tailscale.com) sul PC e sul telefono (stesso account), poi sul PC:
+   `tailscale serve --bg 8000`. Il comando stampa l'indirizzo `https://<pc>.<rete>.ts.net`.
+   Non usare `tailscale funnel` e non aprire la porta sul router di casa: Funnel mette il PC su Internet.
+4. **Telefono**: apri `https://<pc>.<rete>.ts.net/m`, inserisci il token (resta salvato nel browser) e
+   "Aggiungi a schermata Home".
+
+Cosa c'è e cosa no:
+- si chatta con il cervello (stessa memoria in una sessione `mobile`, stesse regole di privacy e budget); su Capri
+  nel PC compare la domanda. Dal telefono non si possono lanciare comandi, convertire file o leggere lo schermo;
+- da un proxy si vede solo `/m`: `/v1/*`, `/health` e il resto rispondono 403;
+- cinque token sbagliati bloccano la pagina per cinque minuti; il PC deve essere acceso e `server.py` in esecuzione;
+- le domande dal telefono consumano la stessa quota Claude del PC.
+
 ## Come aggiornare i modelli
 
 I modelli gratuiti su OpenRouter cambiano frequentemente (nuovi modelli, modelli ritirati).
